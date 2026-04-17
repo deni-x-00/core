@@ -137,7 +137,7 @@ static_assert(INTERNAL_COMPUTATIONS_INTERVAL >= NUMBER_OF_COMPUTORS, "Internal c
 // DoW: Day of the week 0: Sunday, 1 = Monday ...
 static unsigned int gFullExternalComputationTimes[][2] =
 {
-    {0x040C0000U, 0x050C0000U}, // Thu 12:00:00 - Fri 12:00:00
+    {0x040C0000U, 0x040C1E00U}, // Thu 12:00:00 - Thu 12:30:00
 };
 
 #define STACK_SIZE 4194304
