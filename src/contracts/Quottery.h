@@ -2384,7 +2384,7 @@ public:
         state.mut().mOperationParams.mAntiSpamAmount = 11;
         state.mut().mOperationParams.discountedFeeForUsers.cleanup();
         setMemory(state.mut().mQtryGov, 0);
-        state.mut().mQtryGov.mOperationId = ID(_V, _A, _E, _F, _X, _O, _E, _V, _K, _P, _O, _X, _B, _A, _R, _T, _U, _T, _B, _M, _C, _P, _L, _T, _V, _G, _I, _B, _Z, _N, _C, _Y, _K, _K, _W, _X, _U, _V, _F, _N, _G, _G, _Q, _M, _F, _P, _X, _E, _E, _F, _X, _F, _F, _O, _E, _E);
+        state.mut().mQtryGov.mOperationId = ID(_W, _F, _C, _E, _L, _J, _R, _T, _M, _T, _Y, _E, _G, _H, _N, _T, _Y, _O, _N, _Q, _O, _W, _V, _Q, _I, _U, _Y, _B, _V, _B, _P, _T, _S, _I, _R, _C, _O, _T, _J, _U, _X, _F, _I, _Q, _A, _Q, _P, _E, _Y, _J, _Q, _G, _Q, _Q, _S, _A);
         state.mut().mQtryGov.mBurnFee = 0;
         state.mut().mQtryGov.mOperationFee = 50; // 5%
         state.mut().mQtryGov.mShareHolderFee = 0; // 0%
@@ -2530,7 +2530,7 @@ public:
     BEGIN_EPOCH()
     {
         // TODO: reinitialize after proposal getting passed
-        if (qpi.epoch() == 210)
+        if (qpi.epoch() == 209)
         {
             CALL(Reinit, input, output);
         }
