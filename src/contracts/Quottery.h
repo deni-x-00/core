@@ -30,6 +30,15 @@ constexpr uint64 QUOTTERY_MATCH_TYPE_2 = 100011; // A0,A1;
 constexpr uint64 QUOTTERY_MATCH_TYPE_3 = 100012; // B0,B1;
 constexpr uint64 QUOTTERY_ADD_BID = 100013;
 constexpr uint64 QUOTTERY_ADD_ASK = 100014;
+constexpr uint64 QUOTTERY_CREATED_EVENT_GROUP = 100015;
+constexpr uint64 QUOTTERY_ADDED_MARKET_TO_EVENT_GROUP = 100016;
+constexpr uint64 QUOTTERY_OPENED_EVENT_GROUP = 100017;
+constexpr uint64 QUOTTERY_PUBLISHED_EVENT_GROUP_RESULT = 100018;
+constexpr uint64 QUOTTERY_RESOLVED_EVENT_GROUP_DISPUTE = 100019;
+constexpr uint64 QUOTTERY_FINALIZED_EVENT_GROUP = 100020;
+constexpr uint64 QUOTTERY_ARCHIVED_EVENT_GROUP = 100021;
+constexpr uint64 QUOTTERY_DISPUTED_EVENT_GROUP = 100022;
+constexpr uint64 QUOTTERY_CANCELED_EVENT_GROUP = 100023;
 constexpr uint64 QUOTTERY_ASK_BIT = 0;
 constexpr uint64 QUOTTERY_BID_BIT = 1;
 constexpr uint64 QUOTTERY_EID_MASK = 0x3FFFFFFFFFFFFFFFULL; // (2^62 - 1);
@@ -37,6 +46,14 @@ constexpr uint64 QUOTTERY_MAX_AMOUNT = 2000000000000LL; // 2 trillion;
 constexpr sint8 QUOTTERY_RESULT_NOT_SET = -1;
 constexpr sint8 QUOTTERY_RESULT_NO = 0;
 constexpr sint8 QUOTTERY_RESULT_YES = 1;
+
+constexpr uint64 QUOTTERY_MAX_MARKETS_PER_EVENT_GROUP = 64;
+constexpr uint8 QUOTTERY_EVENT_GROUP_MODE_INDEPENDENT = 0;
+constexpr uint8 QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE = 1;
+constexpr uint8 QUOTTERY_EVENT_GROUP_STATUS_DRAFT = 0;
+constexpr uint8 QUOTTERY_EVENT_GROUP_STATUS_OPEN = 1;
+constexpr uint8 QUOTTERY_EVENT_GROUP_STATUS_RESOLVING = 2;
+constexpr uint8 QUOTTERY_EVENT_GROUP_STATUS_FINALIZED = 3;
 
 struct QUOTTERY2
 {
@@ -97,6 +114,7 @@ public:
         uint64 antiSpamAmount;
         uint64 depositAmountForDispute;
         id gameOperator;
+        uint64 nIssuedEventGroup;
     };
 
     /**************************************/
@@ -117,6 +135,33 @@ public:
         /*128 sint8s to describe option */
         Array<id, 2> option0Desc;
         Array<id, 2> option1Desc;
+    };
+
+    // A user-facing event groups one or more binary markets. Existing
+    // QtryEventInfo records remain the independently traded market units.
+    struct QtryEventGroupInfo
+    {
+        uint64 eventGroupId;
+        DateAndTime createdDate;
+        DateAndTime openedDate;
+        Array<id, 4> desc;
+        uint16 expectedMarketCount;
+        uint16 marketCount;
+        uint16 finalizedMarketCount;
+        uint16 archivedMarketCount;
+        uint8 mode;
+        uint8 status;
+    };
+
+    struct QtryEventGroupMarkets
+    {
+        Array<uint64, QUOTTERY_MAX_MARKETS_PER_EVENT_GROUP> marketIds;
+    };
+
+    struct QtryMarketGroupLink
+    {
+        uint64 eventGroupId;
+        uint16 marketIndex;
     };
     struct DepositInfo
     {
@@ -220,6 +265,19 @@ public:
         HashMap<id, sint32, 1024> mVoteMap;
         Array<GovHolder, 1024> mGovArray;
         Array<sint64, 1024> mAccumulatedSum;
+
+        // Event groups are appended to preserve the layout of all existing
+        // Quottery state fields during contract-state migration.
+        HashMap<uint64, QtryEventGroupInfo, QUOTTERY_MAX_CONCURRENT_EVENT> mEventGroupInfo;
+        HashMap<uint64, QtryEventGroupMarkets, QUOTTERY_MAX_CONCURRENT_EVENT> mEventGroupMarkets;
+        HashMap<uint64, QtryMarketGroupLink, QUOTTERY_MAX_CONCURRENT_EVENT> mMarketGroupLink;
+        HashMap<uint64, sint8, QUOTTERY_MAX_CONCURRENT_EVENT> mEventGroupResult;
+        HashMap<uint64, uint32, QUOTTERY_MAX_CONCURRENT_EVENT> mEventGroupResultPublishTickTime;
+        HashMap<uint64, DepositInfo, QUOTTERY_MAX_CONCURRENT_EVENT> mEventGroupDisputeInfo;
+        HashMap<uint64, DisputeResolveInfo, QUOTTERY_MAX_CONCURRENT_EVENT> mEventGroupDisputeResolver;
+        HashMap<uint64, DepositInfo, QUOTTERY_MAX_CONCURRENT_EVENT> mEventGroupGODepositInfo;
+        HashMap<uint64, bit, QUOTTERY_MAX_CONCURRENT_EVENT> mEventGroupDisputeResolved;
+        uint64 mCurrentEventGroupID;
     };
 
 
@@ -324,6 +382,8 @@ protected:
     struct ValidateEvent_locals
     {
         QtryEventInfo qei;
+        QtryMarketGroupLink marketGroupLink;
+        QtryEventGroupInfo eventGroupInfo;
         DateAndTime dt;
         bool status;
     };
@@ -340,6 +400,21 @@ protected:
         if (!locals.status)
         {
             return;
+        }
+
+        // Legacy standalone markets have no group link and retain their
+        // original lifecycle. Grouped markets cannot trade while their
+        // parent event is still being assembled.
+        if (state.get().mMarketGroupLink.get(input.eventId, locals.marketGroupLink))
+        {
+            if (!state.get().mEventGroupInfo.get(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo))
+            {
+                return;
+            }
+            if (locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_OPEN)
+            {
+                return;
+            }
         }
 
         locals.dt = qpi.now();
@@ -960,6 +1035,116 @@ public:
             }
         }
     }
+
+    struct GetEventGroup_input
+    {
+        uint64 eventGroupId;
+    };
+    struct GetEventGroup_output
+    {
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        sint32 winningMarketIndex;
+        uint64 winningMarketId;
+        uint32 publishTickTime;
+        DepositInfo disputerInfo;
+        bit exists;
+    };
+    struct GetEventGroup_locals
+    {
+        sint8 winningMarketIndex;
+    };
+
+    PUBLIC_FUNCTION_WITH_LOCALS(GetEventGroup)
+    {
+        setMemory(output, 0);
+        output.winningMarketIndex = QUOTTERY_RESULT_NOT_SET;
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, output.eventGroupInfo))
+        {
+            return;
+        }
+        state.get().mEventGroupMarkets.get(input.eventGroupId, output.markets);
+        if (state.get().mEventGroupResult.get(input.eventGroupId, locals.winningMarketIndex))
+        {
+            output.winningMarketIndex = locals.winningMarketIndex;
+            output.winningMarketId = output.markets.marketIds.get(locals.winningMarketIndex);
+        }
+        state.get().mEventGroupResultPublishTickTime.get(input.eventGroupId, output.publishTickTime);
+        state.get().mEventGroupDisputeInfo.get(input.eventGroupId, output.disputerInfo);
+        output.exists = 1;
+    }
+
+    struct GetMarketEventGroup_input
+    {
+        uint64 marketId;
+    };
+    struct GetMarketEventGroup_output
+    {
+        QtryMarketGroupLink marketGroupLink;
+        uint8 mode;
+        uint8 status;
+        bit exists;
+    };
+    struct GetMarketEventGroup_locals
+    {
+        QtryEventGroupInfo eventGroupInfo;
+    };
+
+    PUBLIC_FUNCTION_WITH_LOCALS(GetMarketEventGroup)
+    {
+        setMemory(output, 0);
+        if (!state.get().mMarketGroupLink.get(input.marketId, output.marketGroupLink))
+        {
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(output.marketGroupLink.eventGroupId, locals.eventGroupInfo))
+        {
+            return;
+        }
+        output.mode = locals.eventGroupInfo.mode;
+        output.status = locals.eventGroupInfo.status;
+        output.exists = 1;
+    }
+
+    struct GetEventGroupInfoBatch_input
+    {
+        Array<uint64, 64> eventGroupIds;
+    };
+    struct GetEventGroupInfoBatch_output
+    {
+        Array<QtryEventGroupInfo, 64> eventGroupInfos;
+        Array<sint8, 64> winningMarketIndices;
+        Array<bit, 64> exists;
+    };
+    struct GetEventGroupInfoBatch_locals
+    {
+        uint64 i;
+        QtryEventGroupInfo eventGroupInfo;
+        sint8 winningMarketIndex;
+    };
+
+    PUBLIC_FUNCTION_WITH_LOCALS(GetEventGroupInfoBatch)
+    {
+        setMemory(output, 0);
+        output.winningMarketIndices.setAll(QUOTTERY_RESULT_NOT_SET);
+        for (locals.i = 0; locals.i < input.eventGroupIds.capacity(); locals.i++)
+        {
+            if (state.get().mEventGroupInfo.get(
+                input.eventGroupIds.get(locals.i),
+                locals.eventGroupInfo))
+            {
+                output.eventGroupInfos.set(locals.i, locals.eventGroupInfo);
+                output.exists.set(locals.i, 1);
+                if (state.get().mEventGroupResult.get(
+                    input.eventGroupIds.get(locals.i),
+                    locals.winningMarketIndex))
+                {
+                    output.winningMarketIndices.set(locals.i, locals.winningMarketIndex);
+                }
+            }
+        }
+    }
+
     struct AddToAskOrder_input
     {
         uint64 eventId;
@@ -1487,6 +1672,8 @@ public:
     {
         sint8 result;
         DepositInfo di;
+        QtryMarketGroupLink marketGroupLink;
+        QtryEventGroupInfo eventGroupInfo;
     };
 
     // when users not agree with operator, they can dispute
@@ -1510,6 +1697,14 @@ public:
             return;
         }
 
+        if (state.get().mMarketGroupLink.get(input.eventId, locals.marketGroupLink) &&
+            state.get().mEventGroupInfo.get(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo) &&
+            locals.eventGroupInfo.mode == QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
         if (state.get().mDisputeInfo.contains(input.eventId)) // already being disputed by other users
         {
             if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
@@ -1525,6 +1720,63 @@ public:
         locals.di.pubkey = qpi.invocator();
         locals.di.amount = state.get().mQtryGov.mDepositAmountForDispute;
         state.mut().mDisputeInfo.set(input.eventId, locals.di);
+    }
+
+    struct DisputeEventResult_input
+    {
+        uint64 eventGroupId;
+    };
+    struct DisputeEventResult_output
+    {
+        bit disputed;
+    };
+    struct DisputeEventResult_locals
+    {
+        sint32 i;
+        sint8 result;
+        uint32 publishTick;
+        QtryEventGroupInfo eventGroupInfo;
+        DepositInfo di;
+        DisputeResolveInfo dri;
+        QuotteryLoggerWithData log;
+    };
+
+    PUBLIC_PROCEDURE_WITH_LOCALS(DisputeEventResult)
+    {
+        if (qpi.invocationReward() != state.get().mQtryGov.mDepositAmountForDispute)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.mode != QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_RESOLVING ||
+            !state.get().mEventGroupResult.get(input.eventGroupId, locals.result) ||
+            state.get().mEventGroupDisputeInfo.contains(input.eventGroupId) ||
+            state.get().mEventGroupDisputeResolved.contains(input.eventGroupId))
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        state.get().mEventGroupResultPublishTickTime.get(input.eventGroupId, locals.publishTick);
+        if (locals.publishTick + QUOTTERY_DISPUTE_WINDOW <= qpi.tick())
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
+        locals.di.pubkey = qpi.invocator();
+        locals.di.amount = qpi.invocationReward();
+        state.mut().mEventGroupDisputeInfo.set(input.eventGroupId, locals.di);
+        for (locals.i = 0; locals.i < NUMBER_OF_COMPUTORS; locals.i++)
+        {
+            locals.dri.epochData.set(locals.i, 10000);
+            locals.dri.voteData.set(locals.i, QUOTTERY_RESULT_NOT_SET);
+        }
+        state.mut().mEventGroupDisputeResolver.set(input.eventGroupId, locals.dri);
+        output.disputed = 1;
+        locals.log = QuotteryLoggerWithData{ 0, QUOTTERY_DISPUTED_EVENT_GROUP, id(0, 0, 0, input.eventGroupId), 0 };
+        LOG_INFO(locals.log);
     }
 
     struct UserClaimReward_input
@@ -1792,6 +2044,8 @@ public:
         DepositInfo diDisputer;
         DepositInfo diGO;
         id pubkey;
+        QtryMarketGroupLink marketGroupLink;
+        QtryEventGroupInfo eventGroupInfo;
 
         QuotteryLoggerWithData log;
     };
@@ -1908,7 +2162,161 @@ public:
             locals.fei.winOption = locals.result;
             state.mut().mEventResult.set(input.eventId, locals.result);
             CALL(FinalizeEvent, locals.fei, locals.feo);
+            if (state.get().mMarketGroupLink.get(input.eventId, locals.marketGroupLink) &&
+                state.get().mEventGroupInfo.get(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo))
+            {
+                locals.eventGroupInfo.finalizedMarketCount++;
+                if (locals.eventGroupInfo.finalizedMarketCount == locals.eventGroupInfo.marketCount)
+                {
+                    locals.eventGroupInfo.status = QUOTTERY_EVENT_GROUP_STATUS_FINALIZED;
+                    locals.log = QuotteryLoggerWithData{
+                        0,
+                        QUOTTERY_FINALIZED_EVENT_GROUP,
+                        id(0, 0, 0, locals.marketGroupLink.eventGroupId),
+                        0
+                    };
+                    LOG_INFO(locals.log);
+                }
+                state.mut().mEventGroupInfo.set(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo);
+            }
         }
+    }
+
+    struct ResolveEventDispute_input
+    {
+        uint64 eventGroupId;
+        uint64 winningMarketId;
+    };
+    struct ResolveEventDispute_output
+    {
+        bit resolved;
+    };
+    struct ResolveEventDispute_locals
+    {
+        sint32 i;
+        sint32 isComputor;
+        sint32 voteCount;
+        sint64 disputeRewardPot;
+        sint64 rewardPerComputor;
+        sint64 rewardForWinner;
+        sint8 resultIndex;
+        sint8 goResultIndex;
+        id winnerId;
+        id pubkey;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QtryMarketGroupLink winningMarketLink;
+        DisputeResolveInfo dri;
+        DepositInfo diDisputer;
+        DepositInfo diGO;
+        QuotteryLoggerWithData log;
+    };
+
+    PUBLIC_PROCEDURE_WITH_LOCALS(ResolveEventDispute)
+    {
+        if (qpi.invocationReward() < 10000000)
+        {
+            return;
+        }
+        locals.isComputor = -1;
+        for (locals.i = 0; locals.i < NUMBER_OF_COMPUTORS; locals.i++)
+        {
+            if (qpi.computor(locals.i) == qpi.invocator())
+            {
+                locals.isComputor = locals.i;
+                break;
+            }
+        }
+        if (locals.isComputor == -1)
+        {
+            return;
+        }
+        qpi.transfer(qpi.invocator(), qpi.invocationReward());
+
+        if (!state.get().mEventGroupDisputeInfo.contains(input.eventGroupId) ||
+            !state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.mode != QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets) ||
+            !state.get().mMarketGroupLink.get(input.winningMarketId, locals.winningMarketLink) ||
+            locals.winningMarketLink.eventGroupId != input.eventGroupId)
+        {
+            return;
+        }
+
+        state.get().mEventGroupDisputeResolver.get(input.eventGroupId, locals.dri);
+        locals.resultIndex = (sint8)locals.winningMarketLink.marketIndex;
+        locals.dri.epochData.set(locals.isComputor, qpi.epoch());
+        locals.dri.voteData.set(locals.isComputor, locals.resultIndex);
+        state.mut().mEventGroupDisputeResolver.set(input.eventGroupId, locals.dri);
+
+        locals.voteCount = 0;
+        for (locals.i = 0; locals.i < NUMBER_OF_COMPUTORS; locals.i++)
+        {
+            if (locals.dri.epochData.get(locals.i) == qpi.epoch() &&
+                locals.dri.voteData.get(locals.i) == locals.resultIndex)
+            {
+                locals.voteCount++;
+            }
+        }
+        if (locals.voteCount < QUORUM)
+        {
+            return;
+        }
+
+        state.get().mEventGroupDisputeInfo.get(input.eventGroupId, locals.diDisputer);
+        state.get().mEventGroupGODepositInfo.get(input.eventGroupId, locals.diGO);
+        locals.disputeRewardPot = locals.diDisputer.amount + locals.diGO.amount;
+        locals.rewardPerComputor = QPI::div(
+            QPI::div(locals.disputeRewardPot * 3LL, 10LL),
+            sint64(locals.voteCount)
+        );
+        locals.rewardForWinner = locals.disputeRewardPot - locals.rewardPerComputor * sint64(locals.voteCount);
+        state.get().mEventGroupResult.get(input.eventGroupId, locals.goResultIndex);
+        if (locals.goResultIndex == locals.resultIndex)
+        {
+            locals.winnerId = locals.diGO.pubkey;
+        }
+        else
+        {
+            locals.winnerId = locals.diDisputer.pubkey;
+        }
+        qpi.transfer(locals.winnerId, locals.rewardForWinner);
+
+        for (locals.i = 0; locals.i < NUMBER_OF_COMPUTORS; locals.i++)
+        {
+            if (locals.dri.epochData.get(locals.i) == qpi.epoch() &&
+                locals.dri.voteData.get(locals.i) == locals.resultIndex)
+            {
+                locals.pubkey = qpi.computor(locals.i);
+                qpi.transfer(locals.pubkey, locals.rewardPerComputor);
+            }
+        }
+
+        state.mut().mEventGroupResult.set(input.eventGroupId, locals.resultIndex);
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (locals.i == locals.winningMarketLink.marketIndex)
+            {
+                state.mut().mEventResult.set(locals.markets.marketIds.get(locals.i), QUOTTERY_RESULT_YES);
+            }
+            else
+            {
+                state.mut().mEventResult.set(locals.markets.marketIds.get(locals.i), QUOTTERY_RESULT_NO);
+            }
+        }
+        state.mut().mEventGroupDisputeInfo.removeByKey(input.eventGroupId);
+        state.mut().mEventGroupGODepositInfo.removeByKey(input.eventGroupId);
+        state.mut().mEventGroupDisputeResolver.removeByKey(input.eventGroupId);
+        state.mut().mEventGroupDisputeResolved.set(input.eventGroupId, 1);
+
+        output.resolved = 1;
+        locals.log = QuotteryLoggerWithData{
+            0,
+            QUOTTERY_RESOLVED_EVENT_GROUP_DISPUTE,
+            id(0, locals.winningMarketLink.marketIndex, input.eventGroupId, input.winningMarketId),
+            0
+        };
+        LOG_INFO(locals.log);
     }
 
     /**
@@ -1931,7 +2339,10 @@ public:
         sint8 result;
         DepositInfo di;
         QtryEventInfo qei;
+        QtryMarketGroupLink marketGroupLink;
+        QtryEventGroupInfo eventGroupInfo;
         QuotteryLogger log;
+        QuotteryLoggerWithData groupLog;
         uint32 publishResultTick;
 
         FinalizeEvent_input fei;
@@ -1946,6 +2357,62 @@ public:
         }
         if (!state.get().mEventInfo.get(input.eventId, locals.qei))
         {
+            return;
+        }
+        if (state.get().mEventFinalFlag.contains(input.eventId))
+        {
+            return;
+        }
+
+        if (state.get().mMarketGroupLink.get(input.eventId, locals.marketGroupLink) &&
+            state.get().mEventGroupInfo.get(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo) &&
+            locals.eventGroupInfo.mode == QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE)
+        {
+            if (state.get().mEventGroupDisputeInfo.contains(locals.marketGroupLink.eventGroupId) ||
+                !state.get().mEventGroupResult.get(locals.marketGroupLink.eventGroupId, locals.result))
+            {
+                return;
+            }
+            state.get().mEventGroupResultPublishTickTime.get(
+                locals.marketGroupLink.eventGroupId,
+                locals.publishResultTick
+            );
+            if (!state.get().mEventGroupDisputeResolved.contains(locals.marketGroupLink.eventGroupId) &&
+                locals.publishResultTick + QUOTTERY_DISPUTE_WINDOW > qpi.tick())
+            {
+                return;
+            }
+
+            state.get().mEventResult.get(input.eventId, locals.result);
+            if (locals.result == QUOTTERY_RESULT_NOT_SET)
+            {
+                return;
+            }
+            locals.winOption = (uint64)locals.result;
+
+            if (state.get().mEventGroupGODepositInfo.get(locals.marketGroupLink.eventGroupId, locals.di))
+            {
+                qpi.transfer(locals.di.pubkey, locals.di.amount);
+                state.mut().mEventGroupGODepositInfo.removeByKey(locals.marketGroupLink.eventGroupId);
+            }
+
+            locals.fei.eventId = input.eventId;
+            locals.fei.winOption = locals.winOption;
+            CALL(FinalizeEvent, locals.fei, locals.feo);
+
+            locals.eventGroupInfo.finalizedMarketCount++;
+            if (locals.eventGroupInfo.finalizedMarketCount == locals.eventGroupInfo.marketCount)
+            {
+                locals.eventGroupInfo.status = QUOTTERY_EVENT_GROUP_STATUS_FINALIZED;
+                locals.groupLog = QuotteryLoggerWithData{
+                    0,
+                    QUOTTERY_FINALIZED_EVENT_GROUP,
+                    id(0, 0, 0, locals.marketGroupLink.eventGroupId),
+                    0
+                };
+                LOG_INFO(locals.groupLog);
+            }
+            state.mut().mEventGroupInfo.set(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo);
             return;
         }
 
@@ -1983,6 +2450,24 @@ public:
         locals.fei.eventId = input.eventId;
         locals.fei.winOption = locals.winOption;
         CALL(FinalizeEvent, locals.fei, locals.feo);
+
+        if (state.get().mMarketGroupLink.get(input.eventId, locals.marketGroupLink) &&
+            state.get().mEventGroupInfo.get(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo))
+        {
+            locals.eventGroupInfo.finalizedMarketCount++;
+            if (locals.eventGroupInfo.finalizedMarketCount == locals.eventGroupInfo.marketCount)
+            {
+                locals.eventGroupInfo.status = QUOTTERY_EVENT_GROUP_STATUS_FINALIZED;
+                locals.groupLog = QuotteryLoggerWithData{
+                    0,
+                    QUOTTERY_FINALIZED_EVENT_GROUP,
+                    id(0, 0, 0, locals.marketGroupLink.eventGroupId),
+                    0
+                };
+                LOG_INFO(locals.groupLog);
+            }
+            state.mut().mEventGroupInfo.set(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo);
+        }
     }
 
     /**************************************/
@@ -2004,6 +2489,7 @@ public:
         output.mFeePerDay = state.get().mQtryGov.mFeePerDay;
         output.antiSpamAmount = state.get().mOperationParams.mAntiSpamAmount;
         output.depositAmountForDispute = state.get().mQtryGov.mDepositAmountForDispute;
+        output.nIssuedEventGroup = state.get().mCurrentEventGroupID;
     }
 
     struct GetActiveEvent_input
@@ -2175,9 +2661,304 @@ public:
         LOG_INFO(locals.log);
     }
 
+    struct CreateEventGroup_input
+    {
+        Array<id, 4> desc;
+        uint16 expectedMarketCount;
+        uint8 mode;
+    };
+    struct CreateEventGroup_output
+    {
+        uint64 eventGroupId;
+        bit created;
+    };
+    struct CreateEventGroup_locals
+    {
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QuotteryLoggerWithData log;
+    };
+
+    PUBLIC_PROCEDURE_WITH_LOCALS(CreateEventGroup)
+    {
+        if (qpi.invocator() != state.get().mQtryGov.mOperationId)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (input.mode > QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE ||
+            input.expectedMarketCount == 0 ||
+            input.expectedMarketCount > QUOTTERY_MAX_MARKETS_PER_EVENT_GROUP ||
+            (input.mode == QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE && input.expectedMarketCount < 2))
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (state.get().mEventGroupInfo.population() == QUOTTERY_MAX_CONCURRENT_EVENT)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
+        setMemory(locals.eventGroupInfo, 0);
+        setMemory(locals.markets, 0);
+        locals.eventGroupInfo.eventGroupId = state.mut().mCurrentEventGroupID++;
+        locals.eventGroupInfo.createdDate = qpi.now();
+        locals.eventGroupInfo.desc = input.desc;
+        locals.eventGroupInfo.expectedMarketCount = input.expectedMarketCount;
+        locals.eventGroupInfo.marketCount = 0;
+        locals.eventGroupInfo.mode = input.mode;
+        locals.eventGroupInfo.status = QUOTTERY_EVENT_GROUP_STATUS_DRAFT;
+
+        state.mut().mEventGroupInfo.set(locals.eventGroupInfo.eventGroupId, locals.eventGroupInfo);
+        state.mut().mEventGroupMarkets.set(locals.eventGroupInfo.eventGroupId, locals.markets);
+
+        output.eventGroupId = locals.eventGroupInfo.eventGroupId;
+        output.created = 1;
+        locals.log = QuotteryLoggerWithData{
+            0,
+            QUOTTERY_CREATED_EVENT_GROUP,
+            id(0, input.mode, input.expectedMarketCount, locals.eventGroupInfo.eventGroupId),
+            0
+        };
+        LOG_INFO(locals.log);
+
+        if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+    }
+
+    struct AddMarket_input
+    {
+        uint64 eventGroupId;
+        QtryEventInfo qei;
+    };
+    struct AddMarket_output
+    {
+        uint64 marketId;
+        bit created;
+    };
+    struct AddMarket_locals
+    {
+        DateAndTime dtNow;
+        uint64 duration;
+        sint64 fee;
+        sint32 i;
+        QtryEventInfo qei;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QtryMarketGroupLink marketGroupLink;
+        DisputeResolveInfo dri;
+        QuotteryLogger legacyLog;
+        QuotteryLoggerWithData log;
+    };
+
+    PUBLIC_PROCEDURE_WITH_LOCALS(AddMarket)
+    {
+        if (qpi.invocator() != state.get().mQtryGov.mOperationId)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_DRAFT ||
+            locals.eventGroupInfo.marketCount >= locals.eventGroupInfo.expectedMarketCount)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
+        locals.dtNow = qpi.now();
+        if (input.qei.endDate < locals.dtNow)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        locals.duration = input.qei.endDate.durationMicrosec(locals.dtNow);
+        locals.duration = divUp(locals.duration, 86400000000ULL);
+        locals.fee = locals.duration * state.get().mQtryGov.mFeePerDay;
+        if (locals.fee > qpi.invocationReward() ||
+            state.get().mEventInfo.population() == QUOTTERY_MAX_CONCURRENT_EVENT)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
+        locals.qei = input.qei;
+        locals.qei.eid = state.mut().mCurrentEventID++;
+        locals.qei.openDate = locals.dtNow;
+        state.mut().mEventInfo.set(locals.qei.eid, locals.qei);
+        state.mut().mEventResult.set(locals.qei.eid, QUOTTERY_RESULT_NOT_SET);
+        state.mut().mEventResultPublishTickTime.set(locals.qei.eid, 0);
+        state.mut().mDisputeInfo.removeByKey(locals.qei.eid);
+
+        for (locals.i = 0; locals.i < NUMBER_OF_COMPUTORS; locals.i++)
+        {
+            locals.dri.epochData.set(locals.i, 10000);
+            locals.dri.voteData.set(locals.i, QUOTTERY_RESULT_NOT_SET);
+        }
+        state.mut().mDisputeResolver.set(locals.qei.eid, locals.dri);
+
+        state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets);
+        locals.markets.marketIds.set(locals.eventGroupInfo.marketCount, locals.qei.eid);
+        state.mut().mEventGroupMarkets.set(input.eventGroupId, locals.markets);
+
+        locals.marketGroupLink.eventGroupId = input.eventGroupId;
+        locals.marketGroupLink.marketIndex = locals.eventGroupInfo.marketCount;
+        state.mut().mMarketGroupLink.set(locals.qei.eid, locals.marketGroupLink);
+
+        locals.eventGroupInfo.marketCount++;
+        state.mut().mEventGroupInfo.set(input.eventGroupId, locals.eventGroupInfo);
+
+        output.marketId = locals.qei.eid;
+        output.created = 1;
+        locals.legacyLog = QuotteryLogger{ 0, QUOTTERY_CREATED_EVENT, 0 };
+        LOG_INFO(locals.legacyLog);
+        locals.log = QuotteryLoggerWithData{
+            0,
+            QUOTTERY_ADDED_MARKET_TO_EVENT_GROUP,
+            id(0, locals.marketGroupLink.marketIndex, input.eventGroupId, locals.qei.eid),
+            0
+        };
+        LOG_INFO(locals.log);
+
+        if (qpi.invocationReward() > locals.fee)
+        {
+            qpi.transfer(qpi.invocator(), qpi.invocationReward() - locals.fee);
+        }
+    }
+
+    struct OpenEvent_input
+    {
+        uint64 eventGroupId;
+    };
+    struct OpenEvent_output
+    {
+        bit opened;
+    };
+    struct OpenEvent_locals
+    {
+        uint16 i;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QtryEventInfo qei;
+        QuotteryLoggerWithData log;
+    };
+
+    PUBLIC_PROCEDURE_WITH_LOCALS(OpenEvent)
+    {
+        if (qpi.invocator() != state.get().mQtryGov.mOperationId)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_DRAFT ||
+            locals.eventGroupInfo.marketCount != locals.eventGroupInfo.expectedMarketCount)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (!state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets))
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (!state.get().mEventInfo.get(locals.markets.marketIds.get(locals.i), locals.qei) ||
+                locals.qei.endDate < qpi.now())
+            {
+                if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                return;
+            }
+        }
+
+        locals.eventGroupInfo.status = QUOTTERY_EVENT_GROUP_STATUS_OPEN;
+        locals.eventGroupInfo.openedDate = qpi.now();
+        state.mut().mEventGroupInfo.set(input.eventGroupId, locals.eventGroupInfo);
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            state.get().mEventInfo.get(locals.markets.marketIds.get(locals.i), locals.qei);
+            locals.qei.openDate = locals.eventGroupInfo.openedDate;
+            state.mut().mEventInfo.set(locals.qei.eid, locals.qei);
+            state.mut().mRecentActiveEvent.set(
+                mod(locals.qei.eid, QUOTTERY_MAX_CONCURRENT_EVENT),
+                locals.qei.eid
+            );
+        }
+
+        output.opened = 1;
+        locals.log = QuotteryLoggerWithData{
+            0,
+            QUOTTERY_OPENED_EVENT_GROUP,
+            id(0, locals.eventGroupInfo.mode, locals.eventGroupInfo.marketCount, input.eventGroupId),
+            0
+        };
+        LOG_INFO(locals.log);
+        if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+    }
+
+    struct CancelEventGroup_input
+    {
+        uint64 eventGroupId;
+    };
+    struct CancelEventGroup_output
+    {
+        bit canceled;
+    };
+    struct CancelEventGroup_locals
+    {
+        uint16 i;
+        uint64 marketId;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QuotteryLoggerWithData log;
+    };
+
+    PUBLIC_PROCEDURE_WITH_LOCALS(CancelEventGroup)
+    {
+        if (qpi.invocator() != state.get().mQtryGov.mOperationId)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_DRAFT ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets))
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            state.mut().mEventResult.removeByKey(locals.marketId);
+            state.mut().mEventResultPublishTickTime.removeByKey(locals.marketId);
+            state.mut().mDisputeInfo.removeByKey(locals.marketId);
+            state.mut().mGODepositInfo.removeByKey(locals.marketId);
+            state.mut().mDisputeResolver.removeByKey(locals.marketId);
+            state.mut().mEventInfo.removeByKey(locals.marketId);
+            state.mut().mMarketGroupLink.removeByKey(locals.marketId);
+        }
+        state.mut().mEventGroupMarkets.removeByKey(input.eventGroupId);
+        state.mut().mEventGroupInfo.removeByKey(input.eventGroupId);
+        output.canceled = 1;
+        locals.log = QuotteryLoggerWithData{
+            0,
+            QUOTTERY_CANCELED_EVENT_GROUP,
+            id(0, 0, locals.eventGroupInfo.marketCount, input.eventGroupId),
+            0
+        };
+        LOG_INFO(locals.log);
+        if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+    }
+
     struct PublishResult_locals
     {
         QtryEventInfo qei;
+        QtryMarketGroupLink marketGroupLink;
+        QtryEventGroupInfo eventGroupInfo;
         QuotteryLoggerWithData log;
         DepositInfo di;
         sint8 existingResult;
@@ -2222,6 +3003,17 @@ public:
             return;
         }
 
+        // EXCLUSIVE_ONE has a single group-level result and dispute deposit.
+        // Publishing its child markets independently could create multiple
+        // winners, so it must use PublishEventResult instead.
+        if (state.get().mMarketGroupLink.get(input.eventId, locals.marketGroupLink) &&
+            state.get().mEventGroupInfo.get(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo) &&
+            locals.eventGroupInfo.mode == QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
         if (qpi.now() < locals.qei.endDate)
         {
             if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
@@ -2242,6 +3034,98 @@ public:
         state.mut().mEventResult.set(input.eventId, sint8(input.option));
         state.mut().mEventResultPublishTickTime.set(input.eventId, qpi.tick());
         locals.log = QuotteryLoggerWithData{ 0, QUOTTERY_PUBLISH_RESULT, id(0,0,input.eventId,input.option), 0 };
+        LOG_INFO(locals.log);
+    }
+
+    struct PublishEventResult_input
+    {
+        uint64 eventGroupId;
+        uint64 winningMarketId;
+    };
+    struct PublishEventResult_output
+    {
+        bit published;
+    };
+    struct PublishEventResult_locals
+    {
+        uint16 i;
+        uint32 publishTick;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QtryMarketGroupLink winningMarketLink;
+        QtryEventInfo qei;
+        DepositInfo di;
+        QuotteryLoggerWithData log;
+    };
+
+    PUBLIC_PROCEDURE_WITH_LOCALS(PublishEventResult)
+    {
+        if (qpi.invocator() != state.get().mQtryGov.mOperationId)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (qpi.invocationReward() != state.get().mQtryGov.mDepositAmountForDispute)
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.mode != QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_OPEN ||
+            state.get().mEventGroupResult.contains(input.eventGroupId))
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+        if (!state.get().mMarketGroupLink.get(input.winningMarketId, locals.winningMarketLink) ||
+            locals.winningMarketLink.eventGroupId != input.eventGroupId ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets))
+        {
+            if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+            return;
+        }
+
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (!state.get().mEventInfo.get(locals.markets.marketIds.get(locals.i), locals.qei) ||
+                qpi.now() < locals.qei.endDate)
+            {
+                if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
+                return;
+            }
+        }
+
+        locals.di.pubkey = qpi.invocator();
+        locals.di.amount = qpi.invocationReward();
+        locals.publishTick = qpi.tick();
+        state.mut().mEventGroupGODepositInfo.set(input.eventGroupId, locals.di);
+        state.mut().mEventGroupResult.set(input.eventGroupId, (sint8)locals.winningMarketLink.marketIndex);
+        state.mut().mEventGroupResultPublishTickTime.set(input.eventGroupId, locals.publishTick);
+        state.mut().mEventGroupDisputeResolved.removeByKey(input.eventGroupId);
+
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (locals.i == locals.winningMarketLink.marketIndex)
+            {
+                state.mut().mEventResult.set(locals.markets.marketIds.get(locals.i), QUOTTERY_RESULT_YES);
+            }
+            else
+            {
+                state.mut().mEventResult.set(locals.markets.marketIds.get(locals.i), QUOTTERY_RESULT_NO);
+            }
+            state.mut().mEventResultPublishTickTime.set(locals.markets.marketIds.get(locals.i), locals.publishTick);
+        }
+
+        locals.eventGroupInfo.status = QUOTTERY_EVENT_GROUP_STATUS_RESOLVING;
+        state.mut().mEventGroupInfo.set(input.eventGroupId, locals.eventGroupInfo);
+        output.published = 1;
+        locals.log = QuotteryLoggerWithData{
+            0,
+            QUOTTERY_PUBLISHED_EVENT_GROUP_RESULT,
+            id(0, locals.winningMarketLink.marketIndex, input.eventGroupId, input.winningMarketId),
+            0
+        };
         LOG_INFO(locals.log);
     }
 
@@ -2347,6 +3231,9 @@ public:
         REGISTER_USER_FUNCTION(GetUserPosition, 6);
         REGISTER_USER_FUNCTION(GetApprovedAmount, 7);
         REGISTER_USER_FUNCTION(GetTopProposals, 8);
+        REGISTER_USER_FUNCTION(GetEventGroup, 9);
+        REGISTER_USER_FUNCTION(GetMarketEventGroup, 10);
+        REGISTER_USER_FUNCTION(GetEventGroupInfoBatch, 11);
 
         REGISTER_USER_PROCEDURE(CreateEvent, 1);
         REGISTER_USER_PROCEDURE(AddToAskOrder, 2);
@@ -2366,6 +3253,15 @@ public:
 
         // operation team proc
         REGISTER_USER_PROCEDURE(UpdateFeeDiscountList, 20);
+
+        // event group procedures
+        REGISTER_USER_PROCEDURE(CreateEventGroup, 30);
+        REGISTER_USER_PROCEDURE(AddMarket, 31);
+        REGISTER_USER_PROCEDURE(OpenEvent, 32);
+        REGISTER_USER_PROCEDURE(PublishEventResult, 33);
+        REGISTER_USER_PROCEDURE(DisputeEventResult, 34);
+        REGISTER_USER_PROCEDURE(ResolveEventDispute, 35);
+        REGISTER_USER_PROCEDURE(CancelEventGroup, 36);
 
         // Shareholder proposals: use standard function/procedure indices
         REGISTER_USER_PROCEDURE(ProposalVote, 100);
@@ -2431,7 +3327,11 @@ public:
         sint32 i;
         bit flag;
         QuotteryLoggerWithData log;
+        QuotteryLoggerWithData groupLog;
         uint32 publishResultTick;
+        QtryMarketGroupLink marketGroupLink;
+        QtryEventGroupInfo eventGroupInfo;
+        DepositInfo groupDepositInfo;
     };
     PUBLIC_PROCEDURE_WITH_LOCALS(CleanMemory)
     {
@@ -2451,16 +3351,35 @@ public:
                     state.get().mEventResult.get(locals.eid, locals.winOption);
                     if (locals.winOption != QUOTTERY_RESULT_NOT_SET)
                     {
-                        // skip events that are currently under active dispute
-                        if (state.get().mDisputeInfo.contains(locals.eid))
-                        {
-                            continue;
-                        }
-                        // result is available, now checking if it's still in dispute window
-                        state.get().mEventInfo.get(locals.eid, locals.qei);
-                        // only finalizing after 1000 ticks since result publication
+                        locals.flag = 0;
                         state.get().mEventResultPublishTickTime.get(locals.eid, locals.publishResultTick);
-                        if (locals.publishResultTick + QUOTTERY_DISPUTE_WINDOW < qpi.tick()) // 1000 ticks passed the result publication
+                        if (state.get().mMarketGroupLink.get(locals.eid, locals.marketGroupLink) &&
+                            state.get().mEventGroupInfo.get(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo) &&
+                            locals.eventGroupInfo.mode == QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE)
+                        {
+                            if (state.get().mEventGroupDisputeInfo.contains(locals.marketGroupLink.eventGroupId))
+                            {
+                                continue;
+                            }
+                            if (state.get().mEventGroupDisputeResolved.contains(locals.marketGroupLink.eventGroupId) ||
+                                locals.publishResultTick + QUOTTERY_DISPUTE_WINDOW < qpi.tick())
+                            {
+                                locals.flag = 1;
+                            }
+                        }
+                        else
+                        {
+                            if (state.get().mDisputeInfo.contains(locals.eid))
+                            {
+                                continue;
+                            }
+                            if (locals.publishResultTick + QUOTTERY_DISPUTE_WINDOW < qpi.tick())
+                            {
+                                locals.flag = 1;
+                            }
+                        }
+
+                        if (locals.flag)
                         {
                             if (!state.get().mEventFinalFlag.contains(locals.eid))
                             {
@@ -2500,6 +3419,45 @@ public:
                     locals.log = QuotteryLoggerWithData{ 0, QUOTTERY_ARCHIVE_EVENT, id(0,0, 0, locals.eid), 0 };
                     LOG_INFO(locals.log);
 
+                    if (state.get().mMarketGroupLink.get(locals.eid, locals.marketGroupLink) &&
+                        state.get().mEventGroupInfo.get(locals.marketGroupLink.eventGroupId, locals.eventGroupInfo))
+                    {
+                        if (state.get().mEventGroupGODepositInfo.get(
+                            locals.marketGroupLink.eventGroupId,
+                            locals.groupDepositInfo))
+                        {
+                            qpi.transfer(locals.groupDepositInfo.pubkey, locals.groupDepositInfo.amount);
+                            state.mut().mEventGroupGODepositInfo.removeByKey(locals.marketGroupLink.eventGroupId);
+                        }
+                        locals.eventGroupInfo.archivedMarketCount++;
+                        if (locals.eventGroupInfo.archivedMarketCount == locals.eventGroupInfo.marketCount)
+                        {
+                            locals.groupLog = QuotteryLoggerWithData{
+                                0,
+                                QUOTTERY_ARCHIVED_EVENT_GROUP,
+                                id(0, 0, 0, locals.marketGroupLink.eventGroupId),
+                                0
+                            };
+                            LOG_INFO(locals.groupLog);
+                            state.mut().mEventGroupResult.removeByKey(locals.marketGroupLink.eventGroupId);
+                            state.mut().mEventGroupResultPublishTickTime.removeByKey(locals.marketGroupLink.eventGroupId);
+                            state.mut().mEventGroupDisputeInfo.removeByKey(locals.marketGroupLink.eventGroupId);
+                            state.mut().mEventGroupDisputeResolver.removeByKey(locals.marketGroupLink.eventGroupId);
+                            state.mut().mEventGroupGODepositInfo.removeByKey(locals.marketGroupLink.eventGroupId);
+                            state.mut().mEventGroupDisputeResolved.removeByKey(locals.marketGroupLink.eventGroupId);
+                            state.mut().mEventGroupMarkets.removeByKey(locals.marketGroupLink.eventGroupId);
+                            state.mut().mEventGroupInfo.removeByKey(locals.marketGroupLink.eventGroupId);
+                        }
+                        else
+                        {
+                            state.mut().mEventGroupInfo.set(
+                                locals.marketGroupLink.eventGroupId,
+                                locals.eventGroupInfo
+                            );
+                        }
+                        state.mut().mMarketGroupLink.removeByKey(locals.eid);
+                    }
+
                     // Cleanup the result, freeing the slot in mEventResult
                     state.mut().mEventResult.removeByKey(locals.eid);
                     state.mut().mEventResultPublishTickTime.removeByKey(locals.eid);
@@ -2524,6 +3482,15 @@ public:
             state.mut().mDisputeInfo.cleanup();
             state.mut().mGODepositInfo.cleanup();
             state.mut().mDisputeResolver.cleanup();
+            state.mut().mEventGroupInfo.cleanup();
+            state.mut().mEventGroupMarkets.cleanup();
+            state.mut().mMarketGroupLink.cleanup();
+            state.mut().mEventGroupResult.cleanup();
+            state.mut().mEventGroupResultPublishTickTime.cleanup();
+            state.mut().mEventGroupDisputeInfo.cleanup();
+            state.mut().mEventGroupDisputeResolver.cleanup();
+            state.mut().mEventGroupGODepositInfo.cleanup();
+            state.mut().mEventGroupDisputeResolved.cleanup();
         }
     }
 

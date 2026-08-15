@@ -30,6 +30,7 @@ public:
     {
         initEmptySpectrum();
         initEmptyUniverse();
+        system.epoch = contractDescriptions[QUOTTERY_CONTRACT_INDEX].constructionEpoch;
         INIT_CONTRACT(QUOTTERY);
         callSystemProcedure(QUOTTERY_CONTRACT_INDEX, INITIALIZE);
         owner = id(0, 1, 2, 3);
@@ -108,6 +109,108 @@ public:
         increaseEnergy(caller, amount + 1); // give caller some coins
         QUOTTERY::CreateEvent_output ceo;
         invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 1, cei, ceo, caller, amount);
+    }
+
+    QUOTTERY::CreateEventGroup_output CreateEventGroup(
+        const QUOTTERY::CreateEventGroup_input& input,
+        const id& caller,
+        const sint64 amount = 0)
+    {
+        increaseEnergy(caller, amount + 1);
+        QUOTTERY::CreateEventGroup_output output;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 30, input, output, caller, amount);
+        return output;
+    }
+
+    QUOTTERY::AddMarket_output AddMarket(
+        const QUOTTERY::AddMarket_input& input,
+        const id& caller,
+        const sint64 amount)
+    {
+        increaseEnergy(caller, amount + 1);
+        QUOTTERY::AddMarket_output output;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 31, input, output, caller, amount);
+        return output;
+    }
+
+    QUOTTERY::OpenEvent_output OpenEvent(
+        const uint64 eventGroupId,
+        const id& caller,
+        const sint64 amount = 0)
+    {
+        increaseEnergy(caller, amount + 1);
+        QUOTTERY::OpenEvent_input input;
+        QUOTTERY::OpenEvent_output output;
+        input.eventGroupId = eventGroupId;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 32, input, output, caller, amount);
+        return output;
+    }
+
+    QUOTTERY::PublishEventResult_output PublishEventResult(
+        const uint64 eventGroupId,
+        const uint64 winningMarketId,
+        const id& caller,
+        const sint64 amount)
+    {
+        increaseEnergy(caller, amount + 1);
+        QUOTTERY::PublishEventResult_input input;
+        QUOTTERY::PublishEventResult_output output;
+        input.eventGroupId = eventGroupId;
+        input.winningMarketId = winningMarketId;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 33, input, output, caller, amount);
+        return output;
+    }
+
+    QUOTTERY::DisputeEventResult_output DisputeEventResult(
+        const uint64 eventGroupId,
+        const id& caller,
+        const sint64 amount)
+    {
+        increaseEnergy(caller, amount + 1);
+        QUOTTERY::DisputeEventResult_input input;
+        QUOTTERY::DisputeEventResult_output output;
+        input.eventGroupId = eventGroupId;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 34, input, output, caller, amount);
+        return output;
+    }
+
+    QUOTTERY::ResolveEventDispute_output ResolveEventDispute(
+        const uint64 eventGroupId,
+        const uint64 winningMarketId,
+        const id& caller)
+    {
+        increaseEnergy(caller, 10000001);
+        QUOTTERY::ResolveEventDispute_input input;
+        QUOTTERY::ResolveEventDispute_output output;
+        input.eventGroupId = eventGroupId;
+        input.winningMarketId = winningMarketId;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 35, input, output, caller, 10000000);
+        return output;
+    }
+
+    QUOTTERY::CancelEventGroup_output CancelEventGroup(
+        const uint64 eventGroupId,
+        const id& caller)
+    {
+        QUOTTERY::CancelEventGroup_input input;
+        QUOTTERY::CancelEventGroup_output output;
+        input.eventGroupId = eventGroupId;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 36, input, output, caller, 0);
+        return output;
+    }
+
+    void GetEventGroup(const uint64 eventGroupId, QUOTTERY::GetEventGroup_output& output)
+    {
+        QUOTTERY::GetEventGroup_input input;
+        input.eventGroupId = eventGroupId;
+        callFunction(QUOTTERY_CONTRACT_INDEX, 9, input, output);
+    }
+
+    void GetMarketEventGroup(const uint64 marketId, QUOTTERY::GetMarketEventGroup_output& output)
+    {
+        QUOTTERY::GetMarketEventGroup_input input;
+        input.marketId = marketId;
+        callFunction(QUOTTERY_CONTRACT_INDEX, 10, input, output);
     }
 
     void AddAskOrder(uint64 eid, uint64 amount, uint64 option, uint64 price, const id& caller, sint64 amountQUs = 0)
@@ -447,6 +550,265 @@ TEST(QTRYTest, CreateEvent)
     cei.qei.endDate = dt_end;
     qtry.CreateEvent(cei, operation_id, 0);
     EXPECT_TRUE(state->mCurrentEventID == 1); // not increase
+}
+
+TEST(QTRYTest, EventGroupLifecycle)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 2;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+
+    const auto createGroupOutput = qtry.CreateEventGroup(createGroupInput, operationId);
+    ASSERT_TRUE(createGroupOutput.created);
+    EXPECT_EQ(createGroupOutput.eventGroupId, 0ULL);
+    EXPECT_EQ(state->mCurrentEventGroupID, 1ULL);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = createGroupOutput.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(3600000000ULL * 2);
+
+    const auto firstMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    ASSERT_TRUE(firstMarket.created);
+    EXPECT_EQ(firstMarket.marketId, 0ULL);
+
+    // A group cannot be opened before all expected binary markets exist.
+    const auto earlyOpen = qtry.OpenEvent(createGroupOutput.eventGroupId, operationId);
+    EXPECT_FALSE(earlyOpen.opened);
+
+    id trader = id::randomValue();
+    increaseEnergy(trader, 1000000);
+    qtry.transferQUSD(qtry.owner, trader, 1000000);
+    qtry.AddBidOrder(firstMarket.marketId, 1, 0, 50000, trader);
+    QUOTTERY::GetOrders_output ordersBeforeOpen;
+    qtry.GetOrders(firstMarket.marketId, 0, 1, 0, ordersBeforeOpen);
+    EXPECT_EQ(ordersBeforeOpen.orders.get(0).qo.amount, 0);
+
+    const auto secondMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    ASSERT_TRUE(secondMarket.created);
+    EXPECT_EQ(secondMarket.marketId, 1ULL);
+
+    const auto openOutput = qtry.OpenEvent(createGroupOutput.eventGroupId, operationId);
+    ASSERT_TRUE(openOutput.opened);
+
+    QUOTTERY::GetEventGroup_output eventGroupOutput;
+    qtry.GetEventGroup(createGroupOutput.eventGroupId, eventGroupOutput);
+    ASSERT_TRUE(eventGroupOutput.exists);
+    EXPECT_EQ(eventGroupOutput.eventGroupInfo.status, QUOTTERY_EVENT_GROUP_STATUS_OPEN);
+    EXPECT_EQ(eventGroupOutput.eventGroupInfo.marketCount, 2);
+    EXPECT_EQ(eventGroupOutput.markets.marketIds.get(0), firstMarket.marketId);
+    EXPECT_EQ(eventGroupOutput.markets.marketIds.get(1), secondMarket.marketId);
+
+    QUOTTERY::GetMarketEventGroup_output marketGroupOutput;
+    qtry.GetMarketEventGroup(secondMarket.marketId, marketGroupOutput);
+    ASSERT_TRUE(marketGroupOutput.exists);
+    EXPECT_EQ(marketGroupOutput.marketGroupLink.eventGroupId, createGroupOutput.eventGroupId);
+    EXPECT_EQ(marketGroupOutput.marketGroupLink.marketIndex, 1);
+    EXPECT_EQ(marketGroupOutput.mode, QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE);
+
+    qtry.AddBidOrder(firstMarket.marketId, 1, 0, 50000, trader);
+    QUOTTERY::GetOrders_output ordersAfterOpen;
+    qtry.GetOrders(firstMarket.marketId, 0, 1, 0, ordersAfterOpen);
+    EXPECT_EQ(ordersAfterOpen.orders.get(0).qo.amount, 1);
+
+    // Opening seals the group, so its market set is immutable.
+    const uint64 marketCountBeforeRejectedAdd = state->mCurrentEventID;
+    const auto rejectedMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    EXPECT_FALSE(rejectedMarket.created);
+    EXPECT_EQ(state->mCurrentEventID, marketCountBeforeRejectedAdd);
+}
+
+TEST(QTRYTest, DraftEventGroupCanBeCanceled)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 2;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_INDEPENDENT;
+    const auto group = qtry.CreateEventGroup(createGroupInput, operationId);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = group.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(3600000000ULL);
+    const auto market = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    ASSERT_TRUE(market.created);
+
+    ASSERT_TRUE(qtry.CancelEventGroup(group.eventGroupId, operationId).canceled);
+    EXPECT_FALSE(state->mEventGroupInfo.contains(group.eventGroupId));
+    EXPECT_FALSE(state->mEventGroupMarkets.contains(group.eventGroupId));
+    EXPECT_FALSE(state->mMarketGroupLink.contains(market.marketId));
+    EXPECT_FALSE(state->mEventInfo.contains(market.marketId));
+}
+
+TEST(QTRYTest, IndependentEventGroupUsesPerMarketResult)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 1;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_INDEPENDENT;
+    const auto group = qtry.CreateEventGroup(createGroupInput, operationId);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = group.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(1000000ULL);
+    const auto market = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    updateEtalonTime(2);
+    increaseEnergy(operationId, state->mQtryGov.mDepositAmountForDispute + 1);
+    qtry.PublishResult(
+        market.marketId,
+        QUOTTERY_RESULT_YES,
+        operationId,
+        state->mQtryGov.mDepositAmountForDispute
+    );
+    sint8 result = QUOTTERY_RESULT_NOT_SET;
+    ASSERT_TRUE(state->mEventResult.get(market.marketId, result));
+    EXPECT_EQ(result, QUOTTERY_RESULT_YES);
+
+    updateEtalonTime(QUOTTERY_DISPUTE_WINDOW + 1);
+    qtry.FinalizeEvent(market.marketId, operationId);
+    QUOTTERY::QtryEventGroupInfo groupInfo;
+    ASSERT_TRUE(state->mEventGroupInfo.get(group.eventGroupId, groupInfo));
+    EXPECT_EQ(groupInfo.finalizedMarketCount, 1);
+    EXPECT_EQ(groupInfo.status, QUOTTERY_EVENT_GROUP_STATUS_FINALIZED);
+}
+
+TEST(QTRYTest, ExclusiveEventGroupResultFinalizesBinaryMarkets)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 2;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(createGroupInput, operationId);
+    ASSERT_TRUE(group.created);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = group.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(1000000ULL);
+    const auto losingMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    const auto winningMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    ASSERT_TRUE(losingMarket.created);
+    ASSERT_TRUE(winningMarket.created);
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    updateEtalonTime(2);
+    const sint64 deposit = state->mQtryGov.mDepositAmountForDispute;
+    const auto publish = qtry.PublishEventResult(
+        group.eventGroupId,
+        winningMarket.marketId,
+        operationId,
+        deposit
+    );
+    ASSERT_TRUE(publish.published);
+
+    sint8 result = QUOTTERY_RESULT_NOT_SET;
+    ASSERT_TRUE(state->mEventResult.get(losingMarket.marketId, result));
+    EXPECT_EQ(result, QUOTTERY_RESULT_NO);
+    ASSERT_TRUE(state->mEventResult.get(winningMarket.marketId, result));
+    EXPECT_EQ(result, QUOTTERY_RESULT_YES);
+
+    QUOTTERY::QtryEventGroupInfo groupInfo;
+    ASSERT_TRUE(state->mEventGroupInfo.get(group.eventGroupId, groupInfo));
+    EXPECT_EQ(groupInfo.status, QUOTTERY_EVENT_GROUP_STATUS_RESOLVING);
+
+    updateEtalonTime(QUOTTERY_DISPUTE_WINDOW + 1);
+    qtry.FinalizeEvent(losingMarket.marketId, operationId);
+    qtry.FinalizeEvent(winningMarket.marketId, operationId);
+
+    EXPECT_TRUE(state->mEventFinalFlag.contains(losingMarket.marketId));
+    EXPECT_TRUE(state->mEventFinalFlag.contains(winningMarket.marketId));
+    ASSERT_TRUE(state->mEventGroupInfo.get(group.eventGroupId, groupInfo));
+    EXPECT_EQ(groupInfo.finalizedMarketCount, 2);
+    EXPECT_EQ(groupInfo.status, QUOTTERY_EVENT_GROUP_STATUS_FINALIZED);
+    EXPECT_FALSE(state->mEventGroupGODepositInfo.contains(group.eventGroupId));
+}
+
+TEST(QTRYTest, ExclusiveEventGroupDisputeChangesSingleWinner)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+    state->mQtryGov.mDepositAmountForDispute = 1000000;
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 2;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(createGroupInput, operationId);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = group.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(1000000ULL);
+    const auto firstMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    const auto secondMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    updateEtalonTime(2);
+    ASSERT_TRUE(qtry.PublishEventResult(
+        group.eventGroupId,
+        secondMarket.marketId,
+        operationId,
+        state->mQtryGov.mDepositAmountForDispute
+    ).published);
+
+    id disputer = id::randomValue();
+    ASSERT_TRUE(qtry.DisputeEventResult(
+        group.eventGroupId,
+        disputer,
+        state->mQtryGov.mDepositAmountForDispute
+    ).disputed);
+
+    QUOTTERY::ResolveEventDispute_output resolveOutput;
+    for (int i = 0; i < 451; i++)
+    {
+        resolveOutput = qtry.ResolveEventDispute(
+            group.eventGroupId,
+            firstMarket.marketId,
+            broadcastedComputors.computors.publicKeys[i]
+        );
+    }
+    ASSERT_TRUE(resolveOutput.resolved);
+
+    sint8 result = QUOTTERY_RESULT_NOT_SET;
+    ASSERT_TRUE(state->mEventResult.get(firstMarket.marketId, result));
+    EXPECT_EQ(result, QUOTTERY_RESULT_YES);
+    ASSERT_TRUE(state->mEventResult.get(secondMarket.marketId, result));
+    EXPECT_EQ(result, QUOTTERY_RESULT_NO);
+    EXPECT_TRUE(state->mEventGroupDisputeResolved.contains(group.eventGroupId));
+    EXPECT_FALSE(state->mEventGroupDisputeInfo.contains(group.eventGroupId));
+
+    // A resolved dispute may be finalized immediately, matching legacy
+    // ResolveDispute behavior, but each order book is cleaned separately.
+    qtry.FinalizeEvent(firstMarket.marketId, operationId);
+    qtry.FinalizeEvent(secondMarket.marketId, operationId);
+    EXPECT_TRUE(state->mEventFinalFlag.contains(firstMarket.marketId));
+    EXPECT_TRUE(state->mEventFinalFlag.contains(secondMarket.marketId));
 }
 
 TEST(QTRYTest, MatchingOrders)
