@@ -199,6 +199,154 @@ public:
         return output;
     }
 
+    QUOTTERY::ConvertNegRiskPositions_output ConvertNegRiskPositions(
+        const uint64 eventGroupId,
+        const uint64 noMarketMask,
+        const sint64 amount,
+        const id& caller,
+        const sint64 reward = 0)
+    {
+        increaseEnergy(caller, reward + 1);
+        QUOTTERY::ConvertNegRiskPositions_input input;
+        QUOTTERY::ConvertNegRiskPositions_output output;
+        input.eventGroupId = eventGroupId;
+        input.noMarketMask = noMarketMask;
+        input.amount = amount;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 37, input, output, caller, reward);
+        return output;
+    }
+
+    QUOTTERY::ReverseNegRiskPositions_output ReverseNegRiskPositions(
+        const uint64 eventGroupId,
+        const uint64 noMarketMask,
+        const sint64 amount,
+        const id& caller,
+        const sint64 reward = 0)
+    {
+        increaseEnergy(caller, reward + 1);
+        QUOTTERY::ReverseNegRiskPositions_input input;
+        QUOTTERY::ReverseNegRiskPositions_output output;
+        input.eventGroupId = eventGroupId;
+        input.noMarketMask = noMarketMask;
+        input.amount = amount;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 38, input, output, caller, reward);
+        return output;
+    }
+
+    QUOTTERY::QuoteNegRiskBuy_output QuoteNegRiskBuy(
+        const uint64 eventGroupId,
+        const uint64 targetMarketId,
+        const sint64 amount)
+    {
+        QUOTTERY::QuoteNegRiskBuy_input input;
+        QUOTTERY::QuoteNegRiskBuy_output output;
+        input.eventGroupId = eventGroupId;
+        input.targetMarketId = targetMarketId;
+        input.amount = amount;
+        callFunction(QUOTTERY_CONTRACT_INDEX, 12, input, output);
+        return output;
+    }
+
+    QUOTTERY::QuoteNegRiskSell_output QuoteNegRiskSell(
+        const uint64 eventGroupId,
+        const uint64 targetMarketId,
+        const sint64 amount)
+    {
+        QUOTTERY::QuoteNegRiskSell_input input;
+        QUOTTERY::QuoteNegRiskSell_output output;
+        input.eventGroupId = eventGroupId;
+        input.targetMarketId = targetMarketId;
+        input.amount = amount;
+        callFunction(QUOTTERY_CONTRACT_INDEX, 13, input, output);
+        return output;
+    }
+
+    QUOTTERY::BuyNegRiskPosition_output BuyNegRiskPosition(
+        const uint64 eventGroupId,
+        const uint64 targetMarketId,
+        const sint64 amount,
+        const sint64 maxGrossCost,
+        const id& caller,
+        const sint64 reward = 0)
+    {
+        increaseEnergy(caller, reward + 1);
+        QUOTTERY::BuyNegRiskPosition_input input;
+        QUOTTERY::BuyNegRiskPosition_output output;
+        input.eventGroupId = eventGroupId;
+        input.targetMarketId = targetMarketId;
+        input.amount = amount;
+        input.maxGrossCost = maxGrossCost;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 39, input, output, caller, reward);
+        return output;
+    }
+
+    QUOTTERY::SellNegRiskPosition_output SellNegRiskPosition(
+        const uint64 eventGroupId,
+        const uint64 targetMarketId,
+        const sint64 amount,
+        const sint64 minGrossProceeds,
+        const id& caller,
+        const sint64 reward = 0)
+    {
+        increaseEnergy(caller, reward + 1);
+        QUOTTERY::SellNegRiskPosition_input input;
+        QUOTTERY::SellNegRiskPosition_output output;
+        input.eventGroupId = eventGroupId;
+        input.targetMarketId = targetMarketId;
+        input.amount = amount;
+        input.minGrossProceeds = minGrossProceeds;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 40, input, output, caller, reward);
+        return output;
+    }
+
+    QUOTTERY::MatchEventGroupOrders_output MatchEventGroupOrders(
+        const uint64 eventGroupId,
+        const uint64 maxOrderFills,
+        const id& caller,
+        const sint64 reward = 0)
+    {
+        increaseEnergy(caller, reward + 1);
+        QUOTTERY::MatchEventGroupOrders_input input;
+        QUOTTERY::MatchEventGroupOrders_output output;
+        input.eventGroupId = eventGroupId;
+        input.maxOrderFills = maxOrderFills;
+        invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 41, input, output, caller, reward);
+        return output;
+    }
+
+    id PositionKey(const id& user, const uint64 marketId, const uint64 option)
+    {
+        id key = user;
+        key.u64._3 = (option << 63) | (marketId & QUOTTERY_EID_MASK);
+        return key;
+    }
+
+    void SetPosition(const id& user, const uint64 marketId, const uint64 option, const sint64 amount)
+    {
+        const id key = PositionKey(user, marketId, option);
+        if (amount > 0)
+        {
+            QUOTTERY::QtryOrder position;
+            position.entity = user;
+            position.amount = amount;
+            ASSERT_NE(getState()->mPositionInfo.set(key, position), NULL_INDEX);
+        }
+        else
+        {
+            getState()->mPositionInfo.removeByKey(key);
+        }
+    }
+
+    sint64 PositionAmount(const id& user, const uint64 marketId, const uint64 option)
+    {
+        QUOTTERY::QtryOrder position;
+        if (!getState()->mPositionInfo.get(PositionKey(user, marketId, option), position))
+        {
+            return 0;
+        }
+        return position.amount;
+    }
+
     void GetEventGroup(const uint64 eventGroupId, QUOTTERY::GetEventGroup_output& output)
     {
         QUOTTERY::GetEventGroup_input input;
@@ -622,6 +770,810 @@ TEST(QTRYTest, EventGroupLifecycle)
     const auto rejectedMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
     EXPECT_FALSE(rejectedMarket.created);
     EXPECT_EQ(state->mCurrentEventID, marketCountBeforeRejectedAdd);
+}
+
+TEST(QTRYTest, NegRiskConversionPreservesValueForEveryWinner)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 4;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(createGroupInput, operationId);
+    ASSERT_TRUE(group.created);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = group.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(3600000000ULL);
+
+    uint64 marketIds[4];
+    for (int i = 0; i < 4; i++)
+    {
+        const auto market = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+        ASSERT_TRUE(market.created);
+        marketIds[i] = market.marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    const id trader = id::randomValue();
+    constexpr sint64 amount = 10;
+    const sint64 completeSetValue = amount * state->wholeSharePrice;
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+
+    qtry.SetPosition(trader, marketIds[0], QUOTTERY_RESULT_NO, amount);
+    qtry.SetPosition(trader, marketIds[1], QUOTTERY_RESULT_NO, amount);
+    qtry.transferQUSD(operationId, contractId, completeSetValue * 2);
+
+    const auto conversion = qtry.ConvertNegRiskPositions(group.eventGroupId, 0b0011, amount, trader);
+    ASSERT_TRUE(conversion.converted);
+    EXPECT_EQ(conversion.collateralOut, completeSetValue);
+    EXPECT_EQ(qtry.balanceUSD(trader), completeSetValue);
+    EXPECT_EQ(qtry.balanceUSD(contractId), completeSetValue);
+    EXPECT_EQ(qtry.PositionAmount(trader, marketIds[0], QUOTTERY_RESULT_NO), 0);
+    EXPECT_EQ(qtry.PositionAmount(trader, marketIds[1], QUOTTERY_RESULT_NO), 0);
+    EXPECT_EQ(qtry.PositionAmount(trader, marketIds[2], QUOTTERY_RESULT_YES), amount);
+    EXPECT_EQ(qtry.PositionAmount(trader, marketIds[3], QUOTTERY_RESULT_YES), amount);
+
+    for (int winner = 0; winner < 4; winner++)
+    {
+        const sint64 inputPayout = (winner < 2 ? 1 : 2) * completeSetValue;
+        const sint64 outputPayout = conversion.collateralOut + (winner >= 2 ? completeSetValue : 0);
+        EXPECT_EQ(inputPayout, outputPayout);
+    }
+}
+
+TEST(QTRYTest, NegRiskConversionSupportsOneAndAllNoPositions)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 4;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(createGroupInput, operationId);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = group.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(3600000000ULL);
+
+    uint64 marketIds[4];
+    for (int i = 0; i < 4; i++)
+    {
+        const auto market = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+        ASSERT_TRUE(market.created);
+        marketIds[i] = market.marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    const id singleNoTrader = id::randomValue();
+    constexpr sint64 singleAmount = 7;
+    qtry.SetPosition(singleNoTrader, marketIds[0], QUOTTERY_RESULT_NO, singleAmount);
+    const auto singleConversion = qtry.ConvertNegRiskPositions(group.eventGroupId, 0b0001, singleAmount, singleNoTrader);
+    ASSERT_TRUE(singleConversion.converted);
+    EXPECT_EQ(singleConversion.collateralOut, 0);
+    EXPECT_EQ(qtry.PositionAmount(singleNoTrader, marketIds[0], QUOTTERY_RESULT_NO), 0);
+    for (int i = 1; i < 4; i++)
+    {
+        EXPECT_EQ(qtry.PositionAmount(singleNoTrader, marketIds[i], QUOTTERY_RESULT_YES), singleAmount);
+    }
+
+    const id allNoTrader = id::randomValue();
+    constexpr sint64 allAmount = 5;
+    const sint64 completeSetValue = allAmount * state->wholeSharePrice;
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    for (int i = 0; i < 4; i++)
+    {
+        qtry.SetPosition(allNoTrader, marketIds[i], QUOTTERY_RESULT_NO, allAmount);
+    }
+    qtry.transferQUSD(operationId, contractId, completeSetValue * 4);
+
+    const auto allConversion = qtry.ConvertNegRiskPositions(group.eventGroupId, 0b1111, allAmount, allNoTrader);
+    ASSERT_TRUE(allConversion.converted);
+    EXPECT_EQ(allConversion.collateralOut, completeSetValue * 3);
+    EXPECT_EQ(qtry.balanceUSD(allNoTrader), completeSetValue * 3);
+    for (int i = 0; i < 4; i++)
+    {
+        EXPECT_EQ(qtry.PositionAmount(allNoTrader, marketIds[i], QUOTTERY_RESULT_NO), 0);
+        EXPECT_EQ(qtry.PositionAmount(allNoTrader, marketIds[i], QUOTTERY_RESULT_YES), 0);
+    }
+}
+
+TEST(QTRYTest, NegRiskConversionRejectsInvalidLifecycleAndPreservesStateOnTransferFailure)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+    const id trader = id::randomValue();
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 2;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_INDEPENDENT;
+    const auto independentGroup = qtry.CreateEventGroup(createGroupInput, operationId);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = independentGroup.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(3600000000ULL);
+    uint64 independentMarkets[2];
+    for (int i = 0; i < 2; i++)
+    {
+        independentMarkets[i] = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(independentGroup.eventGroupId, operationId).opened);
+    qtry.SetPosition(trader, independentMarkets[0], QUOTTERY_RESULT_NO, 3);
+    EXPECT_FALSE(qtry.ConvertNegRiskPositions(independentGroup.eventGroupId, 0b01, 3, trader).converted);
+    EXPECT_EQ(qtry.PositionAmount(trader, independentMarkets[0], QUOTTERY_RESULT_NO), 3);
+
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto exclusiveGroup = qtry.CreateEventGroup(createGroupInput, operationId);
+    addMarketInput.eventGroupId = exclusiveGroup.eventGroupId;
+    uint64 exclusiveMarkets[2];
+    for (int i = 0; i < 2; i++)
+    {
+        exclusiveMarkets[i] = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(exclusiveGroup.eventGroupId, operationId).opened);
+    qtry.SetPosition(trader, exclusiveMarkets[0], QUOTTERY_RESULT_NO, 3);
+    qtry.SetPosition(trader, exclusiveMarkets[1], QUOTTERY_RESULT_NO, 3);
+
+    EXPECT_FALSE(qtry.ConvertNegRiskPositions(exclusiveGroup.eventGroupId, 0b100, 3, trader).converted);
+    EXPECT_FALSE(qtry.ConvertNegRiskPositions(exclusiveGroup.eventGroupId, 0b11, 4, trader).converted);
+
+    // The contract has no GARTH. A failed collateral transfer must not burn NO positions.
+    const auto failedTransfer = qtry.ConvertNegRiskPositions(exclusiveGroup.eventGroupId, 0b11, 3, trader);
+    EXPECT_FALSE(failedTransfer.converted);
+    EXPECT_EQ(failedTransfer.collateralOut, 0);
+    EXPECT_EQ(qtry.PositionAmount(trader, exclusiveMarkets[0], QUOTTERY_RESULT_NO), 3);
+    EXPECT_EQ(qtry.PositionAmount(trader, exclusiveMarkets[1], QUOTTERY_RESULT_NO), 3);
+    EXPECT_EQ(qtry.PositionAmount(trader, exclusiveMarkets[0], QUOTTERY_RESULT_YES), 0);
+    EXPECT_EQ(qtry.PositionAmount(trader, exclusiveMarkets[1], QUOTTERY_RESULT_YES), 0);
+}
+
+TEST(QTRYTest, NegRiskConversionStopsAfterResultPublication)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input createGroupInput;
+    memset(&createGroupInput, 0, sizeof(createGroupInput));
+    createGroupInput.expectedMarketCount = 2;
+    createGroupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(createGroupInput, operationId);
+
+    QUOTTERY::AddMarket_input addMarketInput;
+    memset(&addMarketInput, 0, sizeof(addMarketInput));
+    addMarketInput.eventGroupId = group.eventGroupId;
+    addMarketInput.qei.endDate = wrapped_now();
+    addMarketInput.qei.endDate.addMicrosec(1000000ULL);
+    const auto firstMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    const auto secondMarket = qtry.AddMarket(addMarketInput, operationId, state->mQtryGov.mFeePerDay);
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    const id trader = id::randomValue();
+    qtry.SetPosition(trader, firstMarket.marketId, QUOTTERY_RESULT_NO, 2);
+    updateEtalonTime(2);
+    ASSERT_TRUE(qtry.PublishEventResult(
+        group.eventGroupId,
+        secondMarket.marketId,
+        operationId,
+        state->mQtryGov.mDepositAmountForDispute).published);
+
+    EXPECT_FALSE(qtry.ConvertNegRiskPositions(group.eventGroupId, 0b01, 2, trader).converted);
+    EXPECT_EQ(qtry.PositionAmount(trader, firstMarket.marketId, QUOTTERY_RESULT_NO), 2);
+    EXPECT_EQ(qtry.PositionAmount(trader, secondMarket.marketId, QUOTTERY_RESULT_YES), 0);
+}
+
+TEST(QTRYTest, NegRiskReverseConversionRoundTripAndLockedPositionProtection)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 4;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+    uint64 markets[4];
+    for (int i = 0; i < 4; i++)
+    {
+        markets[i] = qtry.AddMarket(marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    const id trader = id::randomValue();
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    constexpr sint64 amount = 6;
+    const sint64 completeSet = amount * state->wholeSharePrice;
+    qtry.SetPosition(trader, markets[0], QUOTTERY_RESULT_NO, amount);
+    qtry.SetPosition(trader, markets[1], QUOTTERY_RESULT_NO, amount);
+    qtry.transferQUSD(operationId, contractId, completeSet * 2);
+
+    ASSERT_TRUE(qtry.ConvertNegRiskPositions(group.eventGroupId, 0b0011, amount, trader).converted);
+    ASSERT_EQ(qtry.PositionAmount(trader, markets[2], QUOTTERY_RESULT_YES), amount);
+    ASSERT_EQ(qtry.PositionAmount(trader, markets[3], QUOTTERY_RESULT_YES), amount);
+
+    // Escrowed YES cannot be consumed by reverse conversion.
+    qtry.AddAskOrder(markets[2], amount, QUOTTERY_RESULT_YES, 50000, trader);
+    const auto locked = qtry.ReverseNegRiskPositions(group.eventGroupId, 0b0011, amount, trader);
+    EXPECT_FALSE(locked.converted);
+    EXPECT_EQ(qtry.PositionAmount(trader, markets[3], QUOTTERY_RESULT_YES), amount);
+    qtry.RemoveAskOrder(markets[2], amount, QUOTTERY_RESULT_YES, 50000, trader);
+
+    qtry.transferQUSD(trader, operationId, completeSet);
+    const auto insufficientCollateral =
+        qtry.ReverseNegRiskPositions(group.eventGroupId, 0b0011, amount, trader);
+    EXPECT_FALSE(insufficientCollateral.converted);
+    EXPECT_EQ(qtry.PositionAmount(trader, markets[2], QUOTTERY_RESULT_YES), amount);
+    EXPECT_EQ(qtry.PositionAmount(trader, markets[3], QUOTTERY_RESULT_YES), amount);
+    qtry.transferQUSD(operationId, trader, completeSet);
+
+    const auto reversed = qtry.ReverseNegRiskPositions(group.eventGroupId, 0b0011, amount, trader);
+    ASSERT_TRUE(reversed.converted);
+    EXPECT_EQ(reversed.collateralIn, completeSet);
+    EXPECT_EQ(qtry.PositionAmount(trader, markets[0], QUOTTERY_RESULT_NO), amount);
+    EXPECT_EQ(qtry.PositionAmount(trader, markets[1], QUOTTERY_RESULT_NO), amount);
+    EXPECT_EQ(qtry.PositionAmount(trader, markets[2], QUOTTERY_RESULT_YES), 0);
+    EXPECT_EQ(qtry.PositionAmount(trader, markets[3], QUOTTERY_RESULT_YES), 0);
+    EXPECT_EQ(qtry.balanceUSD(trader), 0);
+    EXPECT_EQ(qtry.balanceUSD(contractId), completeSet * 2);
+}
+
+TEST(QTRYTest, NegRiskBuyUsesBestDirectAndSyntheticLiquidity)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 3;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+    uint64 markets[3];
+    for (int i = 0; i < 3; i++)
+    {
+        markets[i] = qtry.AddMarket(marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    constexpr sint64 amount = 5;
+    const id noSeller1 = id::randomValue();
+    const id noSeller2 = id::randomValue();
+    const id yesBidder = id::randomValue();
+    const id buyer = id::randomValue();
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    increaseEnergy(noSeller1, 1000000000ULL);
+    increaseEnergy(noSeller2, 1000000000ULL);
+    increaseEnergy(yesBidder, 1000000000ULL);
+    increaseEnergy(buyer, 1000000000ULL);
+    qtry.SetPosition(noSeller1, markets[1], QUOTTERY_RESULT_NO, amount);
+    qtry.SetPosition(noSeller2, markets[2], QUOTTERY_RESULT_NO, amount);
+    qtry.AddAskOrder(markets[1], amount, QUOTTERY_RESULT_NO, 40000, noSeller1);
+    qtry.AddAskOrder(markets[2], amount, QUOTTERY_RESULT_NO, 50000, noSeller2);
+    qtry.transferQUSD(operationId, yesBidder, amount * 70000);
+    qtry.AddBidOrder(markets[1], amount, QUOTTERY_RESULT_YES, 70000, yesBidder);
+    qtry.transferQUSD(operationId, buyer, amount * 80000);
+    qtry.transferQUSD(operationId, contractId, amount * state->wholeSharePrice);
+
+    QUOTTERY::GetOrders_output noAskBefore;
+    QUOTTERY::GetOrders_output yesBidBefore;
+    QUOTTERY::GetOrders_output secondNoAskBefore;
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, 0, noAskBefore);
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, 0, yesBidBefore);
+    qtry.GetOrders(markets[2], QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, 0, secondNoAskBefore);
+    ASSERT_EQ(noAskBefore.orders.get(0).qo.amount, amount);
+    ASSERT_EQ(yesBidBefore.orders.get(0).qo.amount, amount);
+    ASSERT_EQ(secondNoAskBefore.orders.get(0).qo.amount, amount);
+
+    const auto quote = qtry.QuoteNegRiskBuy(group.eventGroupId, markets[0], amount);
+    ASSERT_TRUE(quote.fillable);
+    EXPECT_EQ(quote.grossAmount, amount * (30000 + 50000));
+    EXPECT_EQ(quote.collateralAmount, amount * state->wholeSharePrice);
+    EXPECT_EQ(quote.netAmountBeforeFees, -amount * 20000);
+    EXPECT_EQ(quote.orderFillCount, 2ULL);
+
+    const sint64 buyerBefore = qtry.balanceUSD(buyer);
+    const auto bought = qtry.BuyNegRiskPosition(
+        group.eventGroupId, markets[0], amount, quote.grossAmount, buyer);
+    ASSERT_TRUE(bought.bought);
+    EXPECT_EQ(bought.grossCost, quote.grossAmount);
+    EXPECT_EQ(bought.collateralOut, quote.collateralAmount);
+    EXPECT_EQ(qtry.balanceUSD(buyer) - buyerBefore, -quote.netAmountBeforeFees);
+    EXPECT_EQ(qtry.PositionAmount(buyer, markets[0], QUOTTERY_RESULT_YES), amount);
+    EXPECT_EQ(qtry.PositionAmount(yesBidder, markets[1], QUOTTERY_RESULT_YES), amount);
+    EXPECT_EQ(qtry.balanceUSD(noSeller2), amount * 50000);
+
+    QUOTTERY::GetOrders_output remainingAsk;
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, 0, remainingAsk);
+    EXPECT_EQ(remainingAsk.orders.get(0).qo.amount, amount); // 40k ask was worse than synthetic 30k.
+    QUOTTERY::GetOrders_output consumedYesBid;
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, 0, consumedYesBid);
+    EXPECT_EQ(consumedYesBid.orders.get(0).qo.amount, 0);
+
+    updateEtalonTime(3601);
+    ASSERT_TRUE(qtry.PublishEventResult(
+        group.eventGroupId,
+        markets[0],
+        operationId,
+        state->mQtryGov.mDepositAmountForDispute).published);
+    updateEtalonTime(QUOTTERY_DISPUTE_WINDOW + 1);
+    for (int i = 0; i < 3; i++) qtry.FinalizeEvent(markets[i], operationId);
+    const sint64 beforeClaim = qtry.balanceUSD(buyer);
+    qtry.UserClaimReward(markets[0], buyer);
+    EXPECT_EQ(qtry.balanceUSD(buyer) - beforeClaim, amount * state->wholeSharePrice);
+    EXPECT_EQ(qtry.PositionAmount(buyer, markets[0], QUOTTERY_RESULT_YES), 0);
+}
+
+TEST(QTRYTest, NegRiskBuyRejectsIncompleteDepthAndSlippageWithoutMutation)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 3;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+    uint64 markets[3];
+    for (int i = 0; i < 3; i++)
+    {
+        markets[i] = qtry.AddMarket(marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    constexpr sint64 amount = 4;
+    const id seller1 = id::randomValue();
+    const id seller2 = id::randomValue();
+    const id buyer = id::randomValue();
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    increaseEnergy(seller1, 1000000000ULL);
+    increaseEnergy(seller2, 1000000000ULL);
+    increaseEnergy(buyer, 1000000000ULL);
+    qtry.SetPosition(seller1, markets[1], QUOTTERY_RESULT_NO, amount);
+    qtry.AddAskOrder(markets[1], amount, QUOTTERY_RESULT_NO, 30000, seller1);
+    qtry.transferQUSD(operationId, buyer, 1000000);
+    qtry.transferQUSD(operationId, contractId, amount * state->wholeSharePrice);
+    const sint64 buyerBefore = qtry.balanceUSD(buyer);
+
+    EXPECT_FALSE(qtry.QuoteNegRiskBuy(group.eventGroupId, markets[0], amount).fillable);
+    EXPECT_FALSE(qtry.BuyNegRiskPosition(group.eventGroupId, markets[0], amount, 1000000, buyer).bought);
+    EXPECT_EQ(qtry.balanceUSD(buyer), buyerBefore);
+    EXPECT_EQ(qtry.PositionAmount(buyer, markets[0], QUOTTERY_RESULT_YES), 0);
+
+    qtry.SetPosition(seller2, markets[2], QUOTTERY_RESULT_NO, amount);
+    qtry.AddAskOrder(markets[2], amount, QUOTTERY_RESULT_NO, 40000, seller2);
+    const auto quote = qtry.QuoteNegRiskBuy(group.eventGroupId, markets[0], amount);
+    ASSERT_TRUE(quote.fillable);
+    ASSERT_GT(quote.grossAmount, 0);
+    EXPECT_FALSE(qtry.BuyNegRiskPosition(
+        group.eventGroupId, markets[0], amount, quote.grossAmount - 1, buyer).bought);
+    EXPECT_EQ(qtry.balanceUSD(buyer), buyerBefore);
+    EXPECT_EQ(qtry.PositionAmount(buyer, markets[0], QUOTTERY_RESULT_YES), 0);
+
+    QUOTTERY::GetOrders_output order1;
+    QUOTTERY::GetOrders_output order2;
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, 0, order1);
+    qtry.GetOrders(markets[2], QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, 0, order2);
+    EXPECT_EQ(order1.orders.get(0).qo.amount, amount);
+    EXPECT_EQ(order2.orders.get(0).qo.amount, amount);
+}
+
+TEST(QTRYTest, NegRiskBuyFillsAcrossMultipleOrders)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 3;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+    uint64 markets[3];
+    for (int i = 0; i < 3; i++)
+    {
+        markets[i] = qtry.AddMarket(marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    constexpr sint64 amount = 5;
+    const id firstSeller = id::randomValue();
+    const id secondSeller = id::randomValue();
+    const id thirdSeller = id::randomValue();
+    const id buyer = id::randomValue();
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    increaseEnergy(firstSeller, 1000000000ULL);
+    increaseEnergy(secondSeller, 1000000000ULL);
+    increaseEnergy(thirdSeller, 1000000000ULL);
+    increaseEnergy(buyer, 1000000000ULL);
+    qtry.SetPosition(firstSeller, markets[1], QUOTTERY_RESULT_NO, 2);
+    qtry.SetPosition(secondSeller, markets[1], QUOTTERY_RESULT_NO, 3);
+    qtry.SetPosition(thirdSeller, markets[2], QUOTTERY_RESULT_NO, amount);
+    qtry.AddAskOrder(markets[1], 2, QUOTTERY_RESULT_NO, 20000, firstSeller);
+    qtry.AddAskOrder(markets[1], 3, QUOTTERY_RESULT_NO, 30000, secondSeller);
+    qtry.AddAskOrder(markets[2], amount, QUOTTERY_RESULT_NO, 40000, thirdSeller);
+    qtry.transferQUSD(operationId, buyer, 1000000);
+    qtry.transferQUSD(operationId, contractId, amount * state->wholeSharePrice);
+
+    const auto quote = qtry.QuoteNegRiskBuy(group.eventGroupId, markets[0], amount);
+    ASSERT_TRUE(quote.fillable);
+    EXPECT_EQ(quote.grossAmount, 2 * 20000 + 3 * 30000 + amount * 40000);
+    EXPECT_EQ(quote.orderFillCount, 3ULL);
+    const auto bought = qtry.BuyNegRiskPosition(
+        group.eventGroupId, markets[0], amount, quote.grossAmount, buyer);
+    ASSERT_TRUE(bought.bought);
+    EXPECT_EQ(bought.orderFillCount, 3ULL);
+    EXPECT_EQ(qtry.PositionAmount(buyer, markets[0], QUOTTERY_RESULT_YES), amount);
+
+    QUOTTERY::GetOrders_output firstBook;
+    QUOTTERY::GetOrders_output secondBook;
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, 0, firstBook);
+    qtry.GetOrders(markets[2], QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, 0, secondBook);
+    EXPECT_EQ(firstBook.orders.get(0).qo.amount, 0);
+    EXPECT_EQ(secondBook.orders.get(0).qo.amount, 0);
+}
+
+TEST(QTRYTest, NegRiskSellUsesBestDirectAndSyntheticLiquidity)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 3;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+    uint64 markets[3];
+    for (int i = 0; i < 3; i++)
+    {
+        markets[i] = qtry.AddMarket(marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    constexpr sint64 amount = 5;
+    const id seller = id::randomValue();
+    const id noBidder1 = id::randomValue();
+    const id noBidder2 = id::randomValue();
+    const id yesSeller = id::randomValue();
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    increaseEnergy(seller, 1000000000ULL);
+    increaseEnergy(noBidder1, 1000000000ULL);
+    increaseEnergy(noBidder2, 1000000000ULL);
+    increaseEnergy(yesSeller, 1000000000ULL);
+    qtry.SetPosition(seller, markets[0], QUOTTERY_RESULT_YES, amount);
+    qtry.SetPosition(yesSeller, markets[1], QUOTTERY_RESULT_YES, amount);
+    qtry.AddAskOrder(markets[1], amount, QUOTTERY_RESULT_YES, 50000, yesSeller);
+    qtry.transferQUSD(operationId, noBidder1, amount * 40000);
+    qtry.transferQUSD(operationId, noBidder2, amount * 60000);
+    qtry.AddBidOrder(markets[1], amount, QUOTTERY_RESULT_NO, 40000, noBidder1);
+    qtry.AddBidOrder(markets[2], amount, QUOTTERY_RESULT_NO, 60000, noBidder2);
+    qtry.transferQUSD(operationId, seller, amount * state->wholeSharePrice);
+    qtry.transferQUSD(operationId, contractId, amount * state->wholeSharePrice);
+
+    const auto quote = qtry.QuoteNegRiskSell(group.eventGroupId, markets[0], amount);
+    ASSERT_TRUE(quote.fillable);
+    EXPECT_EQ(quote.grossAmount, amount * (50000 + 60000));
+    EXPECT_EQ(quote.collateralAmount, amount * state->wholeSharePrice);
+    EXPECT_EQ(quote.netAmountBeforeFees, amount * 10000);
+
+    const sint64 sellerBefore = qtry.balanceUSD(seller);
+    const auto sold = qtry.SellNegRiskPosition(
+        group.eventGroupId, markets[0], amount, quote.grossAmount, seller);
+    ASSERT_TRUE(sold.sold);
+    EXPECT_EQ(qtry.balanceUSD(seller) - sellerBefore, quote.netAmountBeforeFees);
+    EXPECT_EQ(qtry.PositionAmount(seller, markets[0], QUOTTERY_RESULT_YES), 0);
+    EXPECT_EQ(qtry.PositionAmount(noBidder2, markets[2], QUOTTERY_RESULT_NO), amount);
+    EXPECT_EQ(qtry.balanceUSD(yesSeller), amount * 50000);
+
+    QUOTTERY::GetOrders_output worseNoBid;
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_NO, QUOTTERY_BID_BIT, 0, worseNoBid);
+    EXPECT_EQ(worseNoBid.orders.get(0).qo.amount, amount); // Synthetic demand paid 50k vs direct 40k.
+    QUOTTERY::GetOrders_output consumedYesAsk;
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_YES, QUOTTERY_ASK_BIT, 0, consumedYesAsk);
+    EXPECT_EQ(consumedYesAsk.orders.get(0).qo.amount, 0);
+}
+
+TEST(QTRYTest, NegRiskGroupMintUsesOneCollateralSet)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 4;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+
+    uint64 markets[4];
+    for (int i = 0; i < 4; i++)
+    {
+        markets[i] = qtry.AddMarket(
+            marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    constexpr sint64 amount = 5;
+    const sint64 prices[4] = { 50000, 30000, 20000, 10000 };
+    id bidders[4] = {
+        id::randomValue(), id::randomValue(), id::randomValue(), id::randomValue()
+    };
+    for (int i = 0; i < 4; i++) increaseEnergy(bidders[i], 1000000000ULL);
+
+    // The first three books cannot mint until the fourth YES bid exists.
+    for (int i = 1; i < 4; i++)
+    {
+        qtry.transferQUSD(operationId, bidders[i], amount * prices[i]);
+        qtry.AddBidOrder(markets[i], amount, QUOTTERY_RESULT_YES, prices[i], bidders[i]);
+        EXPECT_EQ(qtry.PositionAmount(bidders[i], markets[i], QUOTTERY_RESULT_YES), 0);
+    }
+
+    qtry.transferQUSD(operationId, bidders[0], amount * prices[0]);
+    qtry.AddBidOrder(markets[0], amount, QUOTTERY_RESULT_YES, prices[0], bidders[0]);
+
+    for (int i = 0; i < 4; i++)
+    {
+        EXPECT_EQ(qtry.PositionAmount(bidders[i], markets[i], QUOTTERY_RESULT_YES), amount);
+        QUOTTERY::GetOrders_output orders;
+        qtry.GetOrders(markets[i], QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, 0, orders);
+        EXPECT_EQ(orders.orders.get(0).qo.amount, 0);
+    }
+
+    // Makers pay their bid prices. The final bidder is the taker and receives
+    // the 10k-per-share price improvement, leaving one W-backed group set.
+    EXPECT_EQ(qtry.balanceUSD(bidders[0]), amount * 10000);
+    EXPECT_EQ(qtry.balanceUSD(bidders[1]), 0);
+    EXPECT_EQ(qtry.balanceUSD(bidders[2]), 0);
+    EXPECT_EQ(qtry.balanceUSD(bidders[3]), 0);
+    EXPECT_EQ(qtry.balanceUSD(contractId), amount * state->wholeSharePrice);
+}
+
+TEST(QTRYTest, NegRiskGroupMergeNeedsNoAdditionalSellerCollateral)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 4;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+
+    uint64 markets[4];
+    for (int i = 0; i < 4; i++)
+    {
+        markets[i] = qtry.AddMarket(
+            marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    constexpr sint64 amount = 3;
+    const sint64 prices[4] = { 10000, 20000, 20000, 20000 };
+    id sellers[4] = {
+        id::randomValue(), id::randomValue(), id::randomValue(), id::randomValue()
+    };
+    for (int i = 0; i < 4; i++)
+    {
+        increaseEnergy(sellers[i], 1000000000ULL);
+        qtry.SetPosition(sellers[i], markets[i], QUOTTERY_RESULT_YES, amount);
+    }
+    qtry.transferQUSD(operationId, contractId, amount * state->wholeSharePrice);
+
+    for (int i = 1; i < 4; i++)
+    {
+        qtry.AddAskOrder(markets[i], amount, QUOTTERY_RESULT_YES, prices[i], sellers[i]);
+    }
+    qtry.AddAskOrder(markets[0], amount, QUOTTERY_RESULT_YES, prices[0], sellers[0]);
+
+    for (int i = 0; i < 4; i++)
+    {
+        EXPECT_EQ(qtry.PositionAmount(sellers[i], markets[i], QUOTTERY_RESULT_YES), 0);
+        QUOTTERY::GetOrders_output orders;
+        qtry.GetOrders(markets[i], QUOTTERY_RESULT_YES, QUOTTERY_ASK_BIT, 0, orders);
+        EXPECT_EQ(orders.orders.get(0).qo.amount, 0);
+    }
+
+    EXPECT_EQ(qtry.balanceUSD(sellers[0]), amount * 40000);
+    EXPECT_EQ(qtry.balanceUSD(sellers[1]), amount * 20000);
+    EXPECT_EQ(qtry.balanceUSD(sellers[2]), amount * 20000);
+    EXPECT_EQ(qtry.balanceUSD(sellers[3]), amount * 20000);
+    EXPECT_EQ(qtry.balanceUSD(contractId), 0);
+}
+
+TEST(QTRYTest, NegRiskGroupMintWaitsForEveryMarketAndUsesMinimumDepth)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 3;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+
+    uint64 markets[3];
+    for (int i = 0; i < 3; i++)
+    {
+        markets[i] = qtry.AddMarket(
+            marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    const sint64 amounts[3] = { 2, 5, 5 };
+    const sint64 prices[3] = { 40000, 30000, 30000 };
+    id bidders[3] = { id::randomValue(), id::randomValue(), id::randomValue() };
+    for (int i = 0; i < 3; i++)
+    {
+        increaseEnergy(bidders[i], 1000000000ULL);
+        qtry.transferQUSD(operationId, bidders[i], amounts[i] * prices[i]);
+    }
+
+    qtry.AddBidOrder(markets[0], amounts[0], QUOTTERY_RESULT_YES, prices[0], bidders[0]);
+    qtry.AddBidOrder(markets[1], amounts[1], QUOTTERY_RESULT_YES, prices[1], bidders[1]);
+    EXPECT_EQ(qtry.PositionAmount(bidders[0], markets[0], QUOTTERY_RESULT_YES), 0);
+    EXPECT_EQ(qtry.PositionAmount(bidders[1], markets[1], QUOTTERY_RESULT_YES), 0);
+
+    qtry.AddBidOrder(markets[2], amounts[2], QUOTTERY_RESULT_YES, prices[2], bidders[2]);
+    for (int i = 0; i < 3; i++)
+    {
+        EXPECT_EQ(qtry.PositionAmount(bidders[i], markets[i], QUOTTERY_RESULT_YES), 2);
+    }
+
+    QUOTTERY::GetOrders_output firstOrders;
+    QUOTTERY::GetOrders_output secondOrders;
+    QUOTTERY::GetOrders_output thirdOrders;
+    qtry.GetOrders(markets[0], QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, 0, firstOrders);
+    qtry.GetOrders(markets[1], QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, 0, secondOrders);
+    qtry.GetOrders(markets[2], QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, 0, thirdOrders);
+    EXPECT_EQ(firstOrders.orders.get(0).qo.amount, 0);
+    EXPECT_EQ(secondOrders.orders.get(0).qo.amount, 3);
+    EXPECT_EQ(thirdOrders.orders.get(0).qo.amount, 3);
+}
+
+TEST(QTRYTest, IndependentGroupDoesNotUseNegRiskGroupMatching)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 3;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_INDEPENDENT;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+
+    uint64 markets[3];
+    for (int i = 0; i < 3; i++)
+    {
+        markets[i] = qtry.AddMarket(
+            marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    const sint64 prices[3] = { 40000, 30000, 30000 };
+    id bidders[3] = { id::randomValue(), id::randomValue(), id::randomValue() };
+    for (int i = 0; i < 3; i++)
+    {
+        increaseEnergy(bidders[i], 1000000000ULL);
+        qtry.transferQUSD(operationId, bidders[i], prices[i]);
+        qtry.AddBidOrder(markets[i], 1, QUOTTERY_RESULT_YES, prices[i], bidders[i]);
+        EXPECT_EQ(qtry.PositionAmount(bidders[i], markets[i], QUOTTERY_RESULT_YES), 0);
+    }
+
+    const auto crank = qtry.MatchEventGroupOrders(group.eventGroupId, 0, bidders[0]);
+    EXPECT_EQ(crank.mintOrderFillCount, 0);
+    EXPECT_EQ(crank.mergeOrderFillCount, 0);
+
+    for (int i = 0; i < 3; i++)
+    {
+        QUOTTERY::GetOrders_output orders;
+        qtry.GetOrders(markets[i], QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, 0, orders);
+        EXPECT_EQ(orders.orders.get(0).qo.amount, 1);
+    }
+}
+
+TEST(QTRYTest, NegRiskGroupCrankIsPermissionlessAndBounded)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+
+    QUOTTERY::CreateEventGroup_input groupInput{};
+    groupInput.expectedMarketCount = 3;
+    groupInput.mode = QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE;
+    const auto group = qtry.CreateEventGroup(groupInput, operationId);
+    QUOTTERY::AddMarket_input marketInput{};
+    marketInput.eventGroupId = group.eventGroupId;
+    marketInput.qei.endDate = wrapped_now();
+    marketInput.qei.endDate.addMicrosec(3600000000ULL);
+
+    uint64 markets[3];
+    for (int i = 0; i < 3; i++)
+    {
+        markets[i] = qtry.AddMarket(
+            marketInput, operationId, state->mQtryGov.mFeePerDay).marketId;
+    }
+    ASSERT_TRUE(qtry.OpenEvent(group.eventGroupId, operationId).opened);
+
+    const sint64 prices[3] = { 40000, 30000, 30000 };
+    id bidders[3] = { id::randomValue(), id::randomValue(), id::randomValue() };
+    for (int i = 0; i < 3; i++)
+    {
+        QUOTTERY::QtryOrder order;
+        order.entity = bidders[i];
+        order.amount = 1;
+        id key = id::zero();
+        key = qtry.MakeOrderKey(
+            markets[i], QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, key);
+        ASSERT_NE(state->mABOrders.add(key, order, prices[i]), NULL_INDEX);
+        qtry.transferQUSD(operationId, contractId, prices[i]);
+    }
+
+    const id keeper = id::randomValue();
+    const auto tooSmall = qtry.MatchEventGroupOrders(group.eventGroupId, 2, keeper);
+    EXPECT_EQ(tooSmall.mintOrderFillCount, 0);
+    for (int i = 0; i < 3; i++)
+    {
+        EXPECT_EQ(qtry.PositionAmount(bidders[i], markets[i], QUOTTERY_RESULT_YES), 0);
+    }
+
+    const auto matched = qtry.MatchEventGroupOrders(group.eventGroupId, 3, keeper);
+    EXPECT_EQ(matched.mintOrderFillCount, 3);
+    EXPECT_EQ(matched.mintMatchCount, 1);
+    EXPECT_EQ(matched.mergeOrderFillCount, 0);
+    for (int i = 0; i < 3; i++)
+    {
+        EXPECT_EQ(qtry.PositionAmount(bidders[i], markets[i], QUOTTERY_RESULT_YES), 1);
+    }
+    EXPECT_EQ(qtry.balanceUSD(contractId), state->wholeSharePrice);
 }
 
 TEST(QTRYTest, DraftEventGroupCanBeCanceled)

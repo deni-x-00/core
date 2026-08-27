@@ -39,6 +39,12 @@ constexpr uint64 QUOTTERY_FINALIZED_EVENT_GROUP = 100020;
 constexpr uint64 QUOTTERY_ARCHIVED_EVENT_GROUP = 100021;
 constexpr uint64 QUOTTERY_DISPUTED_EVENT_GROUP = 100022;
 constexpr uint64 QUOTTERY_CANCELED_EVENT_GROUP = 100023;
+constexpr uint64 QUOTTERY_CONVERTED_NEG_RISK_POSITIONS = 100024;
+constexpr uint64 QUOTTERY_REVERSED_NEG_RISK_POSITIONS = 100025;
+constexpr uint64 QUOTTERY_BOUGHT_NEG_RISK_POSITION = 100026;
+constexpr uint64 QUOTTERY_SOLD_NEG_RISK_POSITION = 100027;
+constexpr uint64 QUOTTERY_MATCHED_EVENT_GROUP_MINT = 100028;
+constexpr uint64 QUOTTERY_MATCHED_EVENT_GROUP_MERGE = 100029;
 constexpr uint64 QUOTTERY_ASK_BIT = 0;
 constexpr uint64 QUOTTERY_BID_BIT = 1;
 constexpr uint64 QUOTTERY_EID_MASK = 0x3FFFFFFFFFFFFFFFULL; // (2^62 - 1);
@@ -48,6 +54,7 @@ constexpr sint8 QUOTTERY_RESULT_NO = 0;
 constexpr sint8 QUOTTERY_RESULT_YES = 1;
 
 constexpr uint64 QUOTTERY_MAX_MARKETS_PER_EVENT_GROUP = 64;
+constexpr uint64 QUOTTERY_MAX_NEG_RISK_ORDER_FILLS = 256;
 constexpr uint8 QUOTTERY_EVENT_GROUP_MODE_INDEPENDENT = 0;
 constexpr uint8 QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE = 1;
 constexpr uint8 QUOTTERY_EVENT_GROUP_STATUS_DRAFT = 0;
@@ -94,6 +101,44 @@ public:
         sint64 price0;
         sint64 price1;
         sint8 _terminator; // Only data before "_terminator" are logged
+    };
+
+    struct QuotteryNegRiskConversionLogger
+    {
+        uint32 _contractIndex;
+        uint32 _type;
+        id trader;
+        uint64 eventGroupId;
+        uint64 noMarketMask;
+        sint64 amount;
+        sint64 collateralOut;
+        sint8 _terminator;
+    };
+
+    struct QuotteryNegRiskRouteLogger
+    {
+        uint32 _contractIndex;
+        uint32 _type;
+        id trader;
+        uint64 eventGroupId;
+        uint64 targetMarketId;
+        sint64 amount;
+        sint64 grossAmount;
+        sint64 collateralAmount;
+        uint64 orderFillCount;
+        sint8 _terminator;
+    };
+
+    struct QuotteryEventGroupTradeLogger
+    {
+        uint32 _contractIndex;
+        uint32 _type;
+        id trader;
+        uint64 eventGroupId;
+        uint64 marketId;
+        sint64 amount;
+        sint64 price;
+        sint8 _terminator;
     };
     /**************************************/
     /********INPUT AND OUTPUT STRUCTS******/
@@ -497,6 +542,12 @@ protected:
         }
         else
         {
+            if ((input.amountChange > 0 && locals.value.amount > INT64_MAX - input.amountChange) ||
+                (input.amountChange < 0 && locals.value.amount < -input.amountChange))
+            {
+                output.ok = 0;
+                return;
+            }
             locals.value.amount += input.amountChange;
             if (locals.value.amount > 0)
             {
@@ -947,6 +998,289 @@ protected:
         }
     }
 
+    struct MatchingEventGroupOrders_input
+    {
+        uint64 eventGroupId;
+        uint64 preferredMarketId;
+        uint64 maxOrderFills;
+        bit isBid;
+    };
+
+    struct MatchingEventGroupOrders_output
+    {
+        uint64 orderFillCount;
+        uint64 matchCount;
+    };
+
+    struct MatchingEventGroupOrders_locals
+    {
+        uint16 i;
+        uint16 pass;
+        uint64 marketId;
+        uint64 preferredMarketId;
+        uint64 index;
+        uint64 newPositionCount;
+        uint64 contractBalance;
+        sint64 price;
+        sint64 actualPrice;
+        sint64 sumPrice;
+        sint64 matchedAmount;
+        sint64 surplus;
+        sint64 adjustment;
+        sint64 transferAmount;
+        sint64 totalTransferAmount;
+        id key;
+        id r;
+        id positionKey;
+        QtryOrder order;
+        QtryOrder position;
+        QtryEventInfo eventInfo;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        DateAndTime now;
+        RewardTransfer_input transferInput;
+        RewardTransfer_output transferOutput;
+        UpdatePosition_input updateInput;
+        UpdatePosition_output updateOutput;
+        QuotteryEventGroupTradeLogger tradeLog;
+    };
+
+    /**
+     * @brief Matches one or more complete EXCLUSIVE_ONE YES sets.
+     * Group mint consumes one YES bid from every market when their prices sum
+     * to at least wholeSharePrice. Group merge consumes one YES ask from every
+     * market when their prices sum to at most wholeSharePrice.
+     *
+     * The preferred market is treated as the taker for price improvement.
+     * When mint surplus exceeds that bid, the remaining improvement is
+     * distributed deterministically by market order. Every execution remains
+     * within each participant's limit price.
+     */
+    PRIVATE_PROCEDURE_WITH_LOCALS(MatchingEventGroupOrders)
+    {
+        setMemory(output, 0);
+        if (input.maxOrderFills == 0 || state.get().wholeSharePrice <= 0 ||
+            !state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.mode != QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_OPEN ||
+            locals.eventGroupInfo.marketCount < 2 ||
+            state.get().mEventGroupResult.contains(input.eventGroupId) ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets))
+        {
+            return;
+        }
+
+        locals.preferredMarketId = locals.markets.marketIds.get(0);
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (locals.markets.marketIds.get(locals.i) == input.preferredMarketId)
+            {
+                locals.preferredMarketId = input.preferredMarketId;
+                break;
+            }
+        }
+
+        while (output.orderFillCount + locals.eventGroupInfo.marketCount <= input.maxOrderFills)
+        {
+            locals.sumPrice = 0;
+            locals.matchedAmount = QUOTTERY_MAX_AMOUNT;
+            locals.now = qpi.now();
+
+            // Quote the best complete YES set at the current book heads.
+            for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+            {
+                locals.marketId = locals.markets.marketIds.get(locals.i);
+                if (!state.get().mEventInfo.get(locals.marketId, locals.eventInfo) ||
+                    locals.now < locals.eventInfo.openDate || locals.now > locals.eventInfo.endDate)
+                {
+                    return;
+                }
+
+                locals.key = MakeOrderKey(
+                    locals.marketId,
+                    QUOTTERY_RESULT_YES,
+                    input.isBid ? QUOTTERY_BID_BIT : QUOTTERY_ASK_BIT,
+                    locals.r);
+                locals.index = state.get().mABOrders.headIndex(locals.key);
+                if (locals.index == NULL_INDEX) return;
+
+                locals.order = state.get().mABOrders.element(locals.index);
+                locals.price = state.get().mABOrders.priority(locals.index);
+                if (!input.isBid) locals.price = -locals.price;
+                if (locals.order.amount <= 0 || locals.price < 0 ||
+                    locals.sumPrice > MAX_AMOUNT - locals.price)
+                {
+                    return;
+                }
+                locals.sumPrice += locals.price;
+                locals.matchedAmount = min(locals.matchedAmount, locals.order.amount);
+            }
+
+            if (locals.matchedAmount <= 0 ||
+                (input.isBid && locals.sumPrice < state.get().wholeSharePrice) ||
+                (!input.isBid && locals.sumPrice > state.get().wholeSharePrice) ||
+                locals.matchedAmount > MAX_AMOUNT / state.get().wholeSharePrice)
+            {
+                return;
+            }
+            locals.totalTransferAmount = locals.matchedAmount * state.get().wholeSharePrice;
+
+            if (input.isBid)
+            {
+                // Preflight every position update before refunding bid surplus.
+                locals.newPositionCount = 0;
+                for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+                {
+                    locals.marketId = locals.markets.marketIds.get(locals.i);
+                    locals.key = MakeOrderKey(
+                        locals.marketId, QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, locals.r);
+                    locals.index = state.get().mABOrders.headIndex(locals.key);
+                    locals.order = state.get().mABOrders.element(locals.index);
+                    locals.positionKey = MakePosKey(
+                        locals.order.entity, locals.marketId, QUOTTERY_RESULT_YES);
+                    if (state.get().mPositionInfo.get(locals.positionKey, locals.position))
+                    {
+                        if (locals.position.amount > INT64_MAX - locals.matchedAmount) return;
+                    }
+                    else
+                    {
+                        locals.newPositionCount++;
+                    }
+                }
+                if (state.get().mPositionInfo.population() + locals.newPositionCount >
+                    state.get().mPositionInfo.capacity())
+                {
+                    return;
+                }
+
+                locals.surplus = locals.sumPrice - state.get().wholeSharePrice;
+                if (locals.surplus && locals.matchedAmount > MAX_AMOUNT / locals.surplus) return;
+                locals.transferAmount = locals.surplus * locals.matchedAmount;
+                locals.contractBalance = qpi.numberOfShares(
+                    state.get().mQUSDIdentifier,
+                    { SELF, SELF_INDEX },
+                    { SELF, SELF_INDEX });
+                if (locals.contractBalance < (uint64)locals.transferAmount) return;
+
+                // Give price improvement to the preferred (taker) market first.
+                // If it cannot absorb all surplus, continue in market order.
+                for (locals.pass = 0; locals.pass < 2; locals.pass++)
+                {
+                    for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+                    {
+                        locals.marketId = locals.markets.marketIds.get(locals.i);
+                        if ((locals.pass == 0 && locals.marketId != locals.preferredMarketId) ||
+                            (locals.pass == 1 && locals.marketId == locals.preferredMarketId))
+                        {
+                            continue;
+                        }
+
+                        locals.key = MakeOrderKey(
+                            locals.marketId, QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, locals.r);
+                        locals.index = state.get().mABOrders.headIndex(locals.key);
+                        locals.order = state.get().mABOrders.element(locals.index);
+                        locals.price = state.get().mABOrders.priority(locals.index);
+                        locals.adjustment = min(locals.price, locals.surplus);
+                        locals.actualPrice = locals.price - locals.adjustment;
+                        locals.surplus -= locals.adjustment;
+
+                        if (locals.adjustment)
+                        {
+                            locals.transferInput.receiver = locals.order.entity;
+                            locals.transferInput.eid = locals.marketId;
+                            locals.transferInput.amount = locals.adjustment * locals.matchedAmount;
+                            locals.transferInput.needChargeFee = 0;
+                            CALL(RewardTransfer, locals.transferInput, locals.transferOutput);
+                            if (!locals.transferOutput.ok) return;
+                        }
+
+                        locals.updateInput.uid = locals.order.entity;
+                        locals.updateInput.amountChange = locals.matchedAmount;
+                        locals.updateInput.oi.eid = locals.marketId;
+                        locals.updateInput.oi.option = QUOTTERY_RESULT_YES;
+                        locals.updateInput.oi.tradeBit = QUOTTERY_BID_BIT;
+                        CALL(UpdatePosition, locals.updateInput, locals.updateOutput);
+                        if (!locals.updateOutput.ok) return;
+
+                        locals.tradeLog = QuotteryEventGroupTradeLogger{
+                            0, QUOTTERY_MATCHED_EVENT_GROUP_MINT, locals.order.entity,
+                            input.eventGroupId, locals.marketId, locals.matchedAmount,
+                            locals.actualPrice, 0
+                        };
+                        LOG_INFO(locals.tradeLog);
+
+                        locals.order.amount -= locals.matchedAmount;
+                        if (locals.order.amount)
+                        {
+                            state.mut().mABOrders.replace(locals.index, locals.order);
+                        }
+                        else
+                        {
+                            state.mut().mABOrders.remove(locals.index);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // A complete YES set releases exactly one whole-share payout.
+                locals.contractBalance = qpi.numberOfShares(
+                    state.get().mQUSDIdentifier,
+                    { SELF, SELF_INDEX },
+                    { SELF, SELF_INDEX });
+                if (locals.contractBalance < (uint64)locals.totalTransferAmount) return;
+
+                locals.surplus = state.get().wholeSharePrice - locals.sumPrice;
+                for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+                {
+                    locals.marketId = locals.markets.marketIds.get(locals.i);
+                    locals.key = MakeOrderKey(
+                        locals.marketId, QUOTTERY_RESULT_YES, QUOTTERY_ASK_BIT, locals.r);
+                    locals.index = state.get().mABOrders.headIndex(locals.key);
+                    locals.order = state.get().mABOrders.element(locals.index);
+                    locals.price = -state.get().mABOrders.priority(locals.index);
+                    locals.actualPrice = locals.price;
+                    if (locals.marketId == locals.preferredMarketId)
+                    {
+                        locals.actualPrice += locals.surplus;
+                    }
+                    if (locals.actualPrice &&
+                        locals.matchedAmount > MAX_AMOUNT / locals.actualPrice)
+                    {
+                        return;
+                    }
+
+                    locals.transferInput.receiver = locals.order.entity;
+                    locals.transferInput.eid = locals.marketId;
+                    locals.transferInput.amount = locals.actualPrice * locals.matchedAmount;
+                    locals.transferInput.needChargeFee = 1;
+                    CALL(RewardTransfer, locals.transferInput, locals.transferOutput);
+                    if (!locals.transferOutput.ok) return;
+
+                    locals.tradeLog = QuotteryEventGroupTradeLogger{
+                        0, QUOTTERY_MATCHED_EVENT_GROUP_MERGE, locals.order.entity,
+                        input.eventGroupId, locals.marketId, locals.matchedAmount,
+                        locals.actualPrice, 0
+                    };
+                    LOG_INFO(locals.tradeLog);
+
+                    locals.order.amount -= locals.matchedAmount;
+                    if (locals.order.amount)
+                    {
+                        state.mut().mABOrders.replace(locals.index, locals.order);
+                    }
+                    else
+                    {
+                        state.mut().mABOrders.remove(locals.index);
+                    }
+                }
+            }
+
+            output.orderFillCount += locals.eventGroupInfo.marketCount;
+            output.matchCount++;
+        }
+    }
+
 public:
     struct GetEventInfo_input
     {
@@ -1163,8 +1497,10 @@ public:
         uint64 index;
         sint64 price;
         bit flag;
+        bit mergedOrder;
         QtryEventInfo qei;
         QtryOrder order;
+        QtryMarketGroupLink marketGroupLink;
 
         OrderInfo oi;
 
@@ -1176,6 +1512,9 @@ public:
 
         MatchingOrders_input moi;
         MatchingOrders_output moo;
+
+        MatchingEventGroupOrders_input groupMatchInput;
+        MatchingEventGroupOrders_output groupMatchOutput;
 
         UpdatePosition_input upi;
         UpdatePosition_output upo;
@@ -1250,6 +1589,7 @@ public:
         locals.key = MakeOrderKey(input.eventId, input.option, QUOTTERY_ASK_BIT, locals.r);
         locals.index = state.get().mABOrders.headIndex(locals.key, -input.price);
         locals.flag = false;
+        locals.mergedOrder = false;
 
         // if there is exact 100% same order as this (same amount, trade bit, price, eventId):
         // if same user => replace new one
@@ -1265,11 +1605,12 @@ public:
                 locals.flag = true;
                 if (locals.order.entity == qpi.invocator())
                 {
-                    // same entity => update => exit
+                    // Aggregate the order, then run both binary and group matching.
                     locals.order.amount += input.amount;
                     state.mut().mABOrders.replace(locals.index, locals.order);
                     output.status = 1;
-                    return;
+                    locals.mergedOrder = true;
+                    break;
                 }
                 locals.index = state.get().mABOrders.nextElementIndex(locals.index);
             }
@@ -1279,32 +1620,38 @@ public:
             }
         }
 
-        locals.order.amount = input.amount;
-        locals.order.entity = qpi.invocator();
-        locals.index = state.mut().mABOrders.add(locals.key, locals.order, -input.price);
+        if (!locals.mergedOrder)
+        {
+            locals.order.amount = input.amount;
+            locals.order.entity = qpi.invocator();
+            locals.index = state.mut().mABOrders.add(locals.key, locals.order, -input.price);
+        }
 
-        if (locals.flag) //there is another unmatched order with the same price, no need to resolve
+        locals.moi.eventId = input.eventId;
+        locals.moi.justAddedIndex = locals.index;
+        locals.flag = 1;
+        while (locals.flag)
         {
-            return;
-        }
-        else
-        {
-            locals.moi.eventId = input.eventId;
-            locals.moi.justAddedIndex = locals.index;
-            locals.flag = 1;
-            while (locals.flag)
+            // Drain all binary matches made possible by this order first.
+            CALL(MatchingOrders, locals.moi, locals.moo);
+            locals.flag = locals.moo.matched;
+            if (locals.flag)
             {
-                // matching orders until no pair of orders can be matched
-                CALL(MatchingOrders, locals.moi, locals.moo);
-                locals.flag = locals.moo.matched;
-                if (locals.flag)
-                {
-                    locals.key = MakeOrderKey(input.eventId, input.option, QUOTTERY_ASK_BIT, locals.r);
-                    locals.moi.justAddedIndex = state.get().mABOrders.headIndex(locals.key, -input.price);
-                }
+                locals.key = MakeOrderKey(input.eventId, input.option, QUOTTERY_ASK_BIT, locals.r);
+                locals.moi.justAddedIndex = state.get().mABOrders.headIndex(locals.key, -input.price);
             }
-            return;
         }
+
+        if (input.option == QUOTTERY_RESULT_YES &&
+            state.get().mMarketGroupLink.get(input.eventId, locals.marketGroupLink))
+        {
+            locals.groupMatchInput.eventGroupId = locals.marketGroupLink.eventGroupId;
+            locals.groupMatchInput.preferredMarketId = input.eventId;
+            locals.groupMatchInput.maxOrderFills = QUOTTERY_MAX_NEG_RISK_ORDER_FILLS;
+            locals.groupMatchInput.isBid = 0;
+            CALL(MatchingEventGroupOrders, locals.groupMatchInput, locals.groupMatchOutput);
+        }
+        return;
     }
 
     struct RemoveAskOrder_input
@@ -1539,14 +1886,19 @@ public:
         uint64 userBalance;
         uint64 totalCost;
         bit flag;
+        bit mergedOrder;
         QtryOrder order;
         QtryEventInfo qei;
+        QtryMarketGroupLink marketGroupLink;
 
         ValidateEvent_input vei;
         ValidateEvent_output veo;
 
         MatchingOrders_input moi;
         MatchingOrders_output moo;
+
+        MatchingEventGroupOrders_input groupMatchInput;
+        MatchingEventGroupOrders_output groupMatchOutput;
 
         QuotteryTradeLogger log;
     };
@@ -1603,6 +1955,7 @@ public:
         locals.key = MakeOrderKey(input.eventId, input.option, QUOTTERY_BID_BIT, locals.r);
         locals.index = state.get().mABOrders.headIndex(locals.key, input.price);
         locals.flag = false;
+        locals.mergedOrder = false;
 
         // if there is exact 100% same order as this (same amount, trade bit, price, eventId):
         // if same user => replace new one
@@ -1618,11 +1971,12 @@ public:
                 locals.flag = true;
                 if (locals.order.entity == qpi.invocator())
                 {
-                    // same entity => update => exit
+                    // Aggregate the order, then run both binary and group matching.
                     locals.order.amount += input.amount;
                     state.mut().mABOrders.replace(locals.index, locals.order);
                     output.status = 1;
-                    return;
+                    locals.mergedOrder = true;
+                    break;
                 }
                 locals.index = state.get().mABOrders.nextElementIndex(locals.index);
             }
@@ -1632,32 +1986,38 @@ public:
             }
         }
 
-        locals.order.amount = input.amount;
-        locals.order.entity = qpi.invocator();
-        locals.index = state.mut().mABOrders.add(locals.key, locals.order, input.price);
+        if (!locals.mergedOrder)
+        {
+            locals.order.amount = input.amount;
+            locals.order.entity = qpi.invocator();
+            locals.index = state.mut().mABOrders.add(locals.key, locals.order, input.price);
+        }
 
-        if (locals.flag) //there is another unmatched order with the same price, no need to resolve
+        locals.moi.eventId = input.eventId;
+        locals.moi.justAddedIndex = locals.index;
+        locals.flag = 1;
+        while (locals.flag)
         {
-            return;
-        }
-        else
-        {
-            locals.moi.eventId = input.eventId;
-            locals.moi.justAddedIndex = locals.index;
-            locals.flag = 1;
-            while (locals.flag)
+            // Drain all binary matches made possible by this order first.
+            CALL(MatchingOrders, locals.moi, locals.moo);
+            locals.flag = locals.moo.matched;
+            if (locals.flag)
             {
-                // matching orders until no pair of orders can be matched
-                CALL(MatchingOrders, locals.moi, locals.moo);
-                locals.flag = locals.moo.matched;
-                if (locals.flag)
-                {
-                    locals.key = MakeOrderKey(input.eventId, input.option, QUOTTERY_BID_BIT, locals.r);
-                    locals.moi.justAddedIndex = state.get().mABOrders.headIndex(locals.key, input.price);
-                }
+                locals.key = MakeOrderKey(input.eventId, input.option, QUOTTERY_BID_BIT, locals.r);
+                locals.moi.justAddedIndex = state.get().mABOrders.headIndex(locals.key, input.price);
             }
-            return;
         }
+
+        if (input.option == QUOTTERY_RESULT_YES &&
+            state.get().mMarketGroupLink.get(input.eventId, locals.marketGroupLink))
+        {
+            locals.groupMatchInput.eventGroupId = locals.marketGroupLink.eventGroupId;
+            locals.groupMatchInput.preferredMarketId = input.eventId;
+            locals.groupMatchInput.maxOrderFills = QUOTTERY_MAX_NEG_RISK_ORDER_FILLS;
+            locals.groupMatchInput.isBid = 1;
+            CALL(MatchingEventGroupOrders, locals.groupMatchInput, locals.groupMatchOutput);
+        }
+        return;
     }
 
     struct Dispute_input
@@ -2954,6 +3314,1324 @@ public:
         if (qpi.invocationReward()) qpi.transfer(qpi.invocator(), qpi.invocationReward());
     }
 
+    struct ConvertNegRiskPositions_input
+    {
+        uint64 eventGroupId;
+        uint64 noMarketMask;
+        sint64 amount;
+    };
+    struct ConvertNegRiskPositions_output
+    {
+        bit converted;
+        sint64 collateralOut;
+    };
+    struct ConvertNegRiskPositions_locals
+    {
+        uint16 i;
+        uint16 noPositionCount;
+        uint64 validMarketMask;
+        uint64 removedPositionCount;
+        uint64 newPositionCount;
+        uint64 resultingPopulation;
+        uint64 marketId;
+        sint64 collateralPerSet;
+        id positionKey;
+        QtryOrder position;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QuotteryNegRiskConversionLogger log;
+    };
+
+    /**
+     * @brief Converts NO positions in an EXCLUSIVE_ONE event group into the
+     * economically equivalent collateral and complementary YES positions.
+     * For m selected NO positions, the output is (m - 1) complete sets of
+     * collateral plus one YES position in every unselected market.
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(ConvertNegRiskPositions)
+    {
+        output.converted = 0;
+        output.collateralOut = 0;
+
+        if (state.get().mOperationParams.mAntiSpamAmount)
+        {
+            if (qpi.invocationReward() < state.get().mOperationParams.mAntiSpamAmount) return;
+            if (qpi.invocationReward() > state.get().mOperationParams.mAntiSpamAmount)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward() - state.get().mOperationParams.mAntiSpamAmount);
+            }
+        }
+
+        if (input.amount <= 0 || input.amount >= (sint64)QUOTTERY_MAX_AMOUNT || input.noMarketMask == 0)
+        {
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.mode != QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_OPEN ||
+            locals.eventGroupInfo.marketCount < 2 ||
+            state.get().mEventGroupResult.contains(input.eventGroupId) ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets))
+        {
+            return;
+        }
+
+        if (locals.eventGroupInfo.marketCount < QUOTTERY_MAX_MARKETS_PER_EVENT_GROUP)
+        {
+            locals.validMarketMask = (1ULL << locals.eventGroupInfo.marketCount) - 1;
+            if (input.noMarketMask & ~locals.validMarketMask)
+            {
+                return;
+            }
+        }
+
+        // Validate every input position and preflight every output position.
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            if (input.noMarketMask & (1ULL << locals.i))
+            {
+                locals.noPositionCount++;
+                locals.positionKey = MakePosKey(qpi.invocator(), locals.marketId, QUOTTERY_RESULT_NO);
+                if (!state.get().mPositionInfo.get(locals.positionKey, locals.position) ||
+                    locals.position.amount < input.amount)
+                {
+                    return;
+                }
+                if (locals.position.amount == input.amount)
+                {
+                    locals.removedPositionCount++;
+                }
+            }
+            else
+            {
+                locals.positionKey = MakePosKey(qpi.invocator(), locals.marketId, QUOTTERY_RESULT_YES);
+                if (state.get().mPositionInfo.get(locals.positionKey, locals.position))
+                {
+                    if (locals.position.amount > INT64_MAX - input.amount)
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    locals.newPositionCount++;
+                }
+            }
+        }
+
+        locals.resultingPopulation = state.get().mPositionInfo.population() -
+            locals.removedPositionCount + locals.newPositionCount;
+        if (locals.resultingPopulation > state.get().mPositionInfo.capacity())
+        {
+            return;
+        }
+
+        if (locals.noPositionCount > 1)
+        {
+            if (state.get().wholeSharePrice <= 0 ||
+                input.amount > MAX_AMOUNT / state.get().wholeSharePrice)
+            {
+                return;
+            }
+            locals.collateralPerSet = input.amount * state.get().wholeSharePrice;
+            if (locals.collateralPerSet > MAX_AMOUNT / (locals.noPositionCount - 1))
+            {
+                return;
+            }
+            output.collateralOut = locals.collateralPerSet * (locals.noPositionCount - 1);
+
+            if (qpi.numberOfShares(
+                    state.get().mQUSDIdentifier,
+                    { SELF, SELF_INDEX },
+                    { SELF, SELF_INDEX }) < output.collateralOut ||
+                qpi.transferShareOwnershipAndPossession(
+                    state.get().mQUSDIdentifier.assetName,
+                    state.get().mQUSDIdentifier.issuer,
+                    SELF,
+                    SELF,
+                    output.collateralOut,
+                    qpi.invocator()) < 0)
+            {
+                output.collateralOut = 0;
+                return;
+            }
+        }
+
+        // Burn the selected NO positions.
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (!(input.noMarketMask & (1ULL << locals.i))) continue;
+
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            locals.positionKey = MakePosKey(qpi.invocator(), locals.marketId, QUOTTERY_RESULT_NO);
+            state.get().mPositionInfo.get(locals.positionKey, locals.position);
+            locals.position.amount -= input.amount;
+            if (locals.position.amount)
+            {
+                state.mut().mPositionInfo.set(locals.positionKey, locals.position);
+            }
+            else
+            {
+                state.mut().mPositionInfo.removeByKey(locals.positionKey);
+            }
+        }
+
+        // Mint the complementary YES positions.
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (input.noMarketMask & (1ULL << locals.i)) continue;
+
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            locals.positionKey = MakePosKey(qpi.invocator(), locals.marketId, QUOTTERY_RESULT_YES);
+            if (!state.get().mPositionInfo.get(locals.positionKey, locals.position))
+            {
+                locals.position.entity = qpi.invocator();
+                locals.position.amount = 0;
+            }
+            locals.position.amount += input.amount;
+            state.mut().mPositionInfo.set(locals.positionKey, locals.position);
+        }
+
+        output.converted = 1;
+        locals.log = QuotteryNegRiskConversionLogger{
+            0,
+            QUOTTERY_CONVERTED_NEG_RISK_POSITIONS,
+            qpi.invocator(),
+            input.eventGroupId,
+            input.noMarketMask,
+            input.amount,
+            output.collateralOut,
+            0
+        };
+        LOG_INFO(locals.log);
+    }
+
+    struct ReverseNegRiskPositions_input
+    {
+        uint64 eventGroupId;
+        uint64 noMarketMask;
+        sint64 amount;
+    };
+    struct ReverseNegRiskPositions_output
+    {
+        bit converted;
+        sint64 collateralIn;
+    };
+    struct ReverseNegRiskPositions_locals
+    {
+        uint16 i;
+        uint16 noPositionCount;
+        uint64 validMarketMask;
+        uint64 removedPositionCount;
+        uint64 newPositionCount;
+        uint64 resultingPopulation;
+        uint64 marketId;
+        sint64 collateralPerSet;
+        uint64 userBalance;
+        id positionKey;
+        QtryOrder position;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QuotteryNegRiskConversionLogger log;
+    };
+
+    /**
+     * @brief Reverses a NegRisk conversion. The caller supplies the YES
+     * positions outside noMarketMask and (selectedCount - 1) complete sets of
+     * collateral, and receives NO positions selected by noMarketMask.
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(ReverseNegRiskPositions)
+    {
+        output.converted = 0;
+        output.collateralIn = 0;
+
+        if (state.get().mOperationParams.mAntiSpamAmount)
+        {
+            if (qpi.invocationReward() < state.get().mOperationParams.mAntiSpamAmount) return;
+            if (qpi.invocationReward() > state.get().mOperationParams.mAntiSpamAmount)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward() - state.get().mOperationParams.mAntiSpamAmount);
+            }
+        }
+
+        if (input.amount <= 0 || input.amount >= (sint64)QUOTTERY_MAX_AMOUNT || input.noMarketMask == 0)
+        {
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.mode != QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_OPEN ||
+            locals.eventGroupInfo.marketCount < 2 ||
+            state.get().mEventGroupResult.contains(input.eventGroupId) ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets))
+        {
+            return;
+        }
+
+        if (locals.eventGroupInfo.marketCount < QUOTTERY_MAX_MARKETS_PER_EVENT_GROUP)
+        {
+            locals.validMarketMask = (1ULL << locals.eventGroupInfo.marketCount) - 1;
+            if (input.noMarketMask & ~locals.validMarketMask)
+            {
+                return;
+            }
+        }
+
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            if (input.noMarketMask & (1ULL << locals.i))
+            {
+                locals.noPositionCount++;
+                locals.positionKey = MakePosKey(qpi.invocator(), locals.marketId, QUOTTERY_RESULT_NO);
+                if (state.get().mPositionInfo.get(locals.positionKey, locals.position))
+                {
+                    if (locals.position.amount > INT64_MAX - input.amount) return;
+                }
+                else
+                {
+                    locals.newPositionCount++;
+                }
+            }
+            else
+            {
+                locals.positionKey = MakePosKey(qpi.invocator(), locals.marketId, QUOTTERY_RESULT_YES);
+                if (!state.get().mPositionInfo.get(locals.positionKey, locals.position) ||
+                    locals.position.amount < input.amount)
+                {
+                    return;
+                }
+                if (locals.position.amount == input.amount)
+                {
+                    locals.removedPositionCount++;
+                }
+            }
+        }
+
+        locals.resultingPopulation = state.get().mPositionInfo.population() -
+            locals.removedPositionCount + locals.newPositionCount;
+        if (locals.resultingPopulation > state.get().mPositionInfo.capacity()) return;
+
+        if (locals.noPositionCount > 1)
+        {
+            if (state.get().wholeSharePrice <= 0 ||
+                input.amount > MAX_AMOUNT / state.get().wholeSharePrice)
+            {
+                return;
+            }
+            locals.collateralPerSet = input.amount * state.get().wholeSharePrice;
+            if (locals.collateralPerSet > MAX_AMOUNT / (locals.noPositionCount - 1)) return;
+            output.collateralIn = locals.collateralPerSet * (locals.noPositionCount - 1);
+
+            locals.userBalance = qpi.numberOfShares(
+                state.get().mQUSDIdentifier,
+                { qpi.invocator(), SELF_INDEX },
+                { qpi.invocator(), SELF_INDEX });
+            if (locals.userBalance < (uint64)output.collateralIn ||
+                qpi.transferShareOwnershipAndPossession(
+                    state.get().mQUSDIdentifier.assetName,
+                    state.get().mQUSDIdentifier.issuer,
+                    qpi.invocator(),
+                    qpi.invocator(),
+                    output.collateralIn,
+                    SELF) < 0)
+            {
+                output.collateralIn = 0;
+                return;
+            }
+        }
+
+        // Burn the complementary YES positions.
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (input.noMarketMask & (1ULL << locals.i)) continue;
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            locals.positionKey = MakePosKey(qpi.invocator(), locals.marketId, QUOTTERY_RESULT_YES);
+            state.get().mPositionInfo.get(locals.positionKey, locals.position);
+            locals.position.amount -= input.amount;
+            if (locals.position.amount)
+            {
+                state.mut().mPositionInfo.set(locals.positionKey, locals.position);
+            }
+            else
+            {
+                state.mut().mPositionInfo.removeByKey(locals.positionKey);
+            }
+        }
+
+        // Mint the selected NO positions.
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (!(input.noMarketMask & (1ULL << locals.i))) continue;
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            locals.positionKey = MakePosKey(qpi.invocator(), locals.marketId, QUOTTERY_RESULT_NO);
+            if (!state.get().mPositionInfo.get(locals.positionKey, locals.position))
+            {
+                locals.position.entity = qpi.invocator();
+                locals.position.amount = 0;
+            }
+            locals.position.amount += input.amount;
+            state.mut().mPositionInfo.set(locals.positionKey, locals.position);
+        }
+
+        output.converted = 1;
+        locals.log = QuotteryNegRiskConversionLogger{
+            0,
+            QUOTTERY_REVERSED_NEG_RISK_POSITIONS,
+            qpi.invocator(),
+            input.eventGroupId,
+            input.noMarketMask,
+            input.amount,
+            output.collateralIn,
+            0
+        };
+        LOG_INFO(locals.log);
+    }
+
+protected:
+    struct QuoteNegRiskRoute_input
+    {
+        uint64 eventGroupId;
+        uint64 targetMarketId;
+        sint64 amount;
+        bit isBuy;
+    };
+    struct QuoteNegRiskRoute_output
+    {
+        bit fillable;
+        sint64 grossAmount;
+        sint64 collateralAmount;
+        sint64 netAmountBeforeFees;
+        uint64 orderFillCount;
+    };
+    struct QuoteNegRiskRoute_locals
+    {
+        uint16 i;
+        sint64 firstIndex;
+        sint64 secondIndex;
+        sint64 remaining;
+        sint64 fillAmount;
+        sint64 firstPrice;
+        sint64 secondPrice;
+        sint64 selectedPrice;
+        sint64 lineAmount;
+        id key;
+        id r;
+        QtryOrder order;
+        QtryEventInfo qei;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QtryMarketGroupLink targetLink;
+        DateAndTime now;
+    };
+
+    /**
+     * @brief Quotes a complete synthetic YES route without changing state.
+     * Buy consumes NO asks or complementary YES bids. Sell consumes NO bids or
+     * complementary YES asks. The whole N-1 leg basket must be fillable.
+     */
+    PRIVATE_FUNCTION_WITH_LOCALS(QuoteNegRiskRoute)
+    {
+        setMemory(output, 0);
+        if (input.amount <= 0 || input.amount >= (sint64)QUOTTERY_MAX_AMOUNT ||
+            state.get().wholeSharePrice <= 0)
+        {
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            locals.eventGroupInfo.mode != QUOTTERY_EVENT_GROUP_MODE_EXCLUSIVE_ONE ||
+            locals.eventGroupInfo.status != QUOTTERY_EVENT_GROUP_STATUS_OPEN ||
+            locals.eventGroupInfo.marketCount < 2 ||
+            state.get().mEventGroupResult.contains(input.eventGroupId) ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets) ||
+            !state.get().mMarketGroupLink.get(input.targetMarketId, locals.targetLink) ||
+            locals.targetLink.eventGroupId != input.eventGroupId ||
+            locals.targetLink.marketIndex >= locals.eventGroupInfo.marketCount ||
+            locals.markets.marketIds.get(locals.targetLink.marketIndex) != input.targetMarketId)
+        {
+            return;
+        }
+
+        if (input.amount > MAX_AMOUNT / state.get().wholeSharePrice) return;
+        output.collateralAmount = input.amount * state.get().wholeSharePrice;
+        if (locals.eventGroupInfo.marketCount > 2)
+        {
+            if (output.collateralAmount > MAX_AMOUNT / (locals.eventGroupInfo.marketCount - 2))
+            {
+                setMemory(output, 0);
+                return;
+            }
+            output.collateralAmount *= (locals.eventGroupInfo.marketCount - 2);
+        }
+        else
+        {
+            output.collateralAmount = 0;
+        }
+
+        locals.now = qpi.now();
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (!state.get().mEventInfo.get(locals.markets.marketIds.get(locals.i), locals.qei) ||
+                locals.now < locals.qei.openDate || locals.now > locals.qei.endDate)
+            {
+                setMemory(output, 0);
+                return;
+            }
+            if (locals.i == locals.targetLink.marketIndex) continue;
+
+            locals.remaining = input.amount;
+            if (input.isBuy)
+            {
+                // Direct NO asks and synthetic NO offers backed by YES bids.
+                locals.key = MakeOrderKey(
+                    locals.markets.marketIds.get(locals.i),
+                    QUOTTERY_RESULT_NO,
+                    QUOTTERY_ASK_BIT,
+                    locals.r);
+                locals.firstIndex = state.get().mABOrders.headIndex(locals.key);
+                locals.key = MakeOrderKey(
+                    locals.markets.marketIds.get(locals.i),
+                    QUOTTERY_RESULT_YES,
+                    QUOTTERY_BID_BIT,
+                    locals.r);
+                locals.secondIndex = state.get().mABOrders.headIndex(locals.key);
+            }
+            else
+            {
+                // Direct NO bids and synthetic NO demand backed by YES asks.
+                locals.key = MakeOrderKey(
+                    locals.markets.marketIds.get(locals.i),
+                    QUOTTERY_RESULT_NO,
+                    QUOTTERY_BID_BIT,
+                    locals.r);
+                locals.firstIndex = state.get().mABOrders.headIndex(locals.key);
+                locals.key = MakeOrderKey(
+                    locals.markets.marketIds.get(locals.i),
+                    QUOTTERY_RESULT_YES,
+                    QUOTTERY_ASK_BIT,
+                    locals.r);
+                locals.secondIndex = state.get().mABOrders.headIndex(locals.key);
+            }
+
+            while (locals.remaining > 0)
+            {
+                if (locals.firstIndex == NULL_INDEX && locals.secondIndex == NULL_INDEX)
+                {
+                    setMemory(output, 0);
+                    return;
+                }
+
+                if (input.isBuy)
+                {
+                    locals.firstPrice = state.get().wholeSharePrice + 1;
+                    locals.secondPrice = state.get().wholeSharePrice + 1;
+                    if (locals.firstIndex != NULL_INDEX)
+                    {
+                        locals.firstPrice = -state.get().mABOrders.priority(locals.firstIndex);
+                    }
+                    if (locals.secondIndex != NULL_INDEX)
+                    {
+                        locals.secondPrice = state.get().wholeSharePrice -
+                            state.get().mABOrders.priority(locals.secondIndex);
+                    }
+                }
+                else
+                {
+                    locals.firstPrice = -1;
+                    locals.secondPrice = -1;
+                    if (locals.firstIndex != NULL_INDEX)
+                    {
+                        locals.firstPrice = state.get().mABOrders.priority(locals.firstIndex);
+                    }
+                    if (locals.secondIndex != NULL_INDEX)
+                    {
+                        locals.secondPrice = state.get().wholeSharePrice +
+                            state.get().mABOrders.priority(locals.secondIndex);
+                    }
+                }
+
+                if ((input.isBuy && locals.firstPrice <= locals.secondPrice) ||
+                    (!input.isBuy && locals.firstPrice >= locals.secondPrice))
+                {
+                    locals.order = state.get().mABOrders.element(locals.firstIndex);
+                    locals.selectedPrice = locals.firstPrice;
+                    locals.fillAmount = min(locals.remaining, locals.order.amount);
+                    if (locals.fillAmount == locals.order.amount)
+                    {
+                        locals.firstIndex = state.get().mABOrders.nextElementIndex(locals.firstIndex);
+                    }
+                }
+                else
+                {
+                    locals.order = state.get().mABOrders.element(locals.secondIndex);
+                    locals.selectedPrice = locals.secondPrice;
+                    locals.fillAmount = min(locals.remaining, locals.order.amount);
+                    if (locals.fillAmount == locals.order.amount)
+                    {
+                        locals.secondIndex = state.get().mABOrders.nextElementIndex(locals.secondIndex);
+                    }
+                }
+
+                if (locals.fillAmount <= 0 || locals.selectedPrice < 0 ||
+                    (locals.selectedPrice && locals.fillAmount > MAX_AMOUNT / locals.selectedPrice))
+                {
+                    setMemory(output, 0);
+                    return;
+                }
+                locals.lineAmount = locals.fillAmount * locals.selectedPrice;
+                if (output.grossAmount > MAX_AMOUNT - locals.lineAmount)
+                {
+                    setMemory(output, 0);
+                    return;
+                }
+                output.grossAmount += locals.lineAmount;
+                output.orderFillCount++;
+                if (output.orderFillCount > QUOTTERY_MAX_NEG_RISK_ORDER_FILLS)
+                {
+                    setMemory(output, 0);
+                    return;
+                }
+                locals.remaining -= locals.fillAmount;
+            }
+        }
+
+        output.netAmountBeforeFees = output.grossAmount - output.collateralAmount;
+        output.fillable = 1;
+    }
+
+public:
+    struct QuoteNegRiskBuy_input
+    {
+        uint64 eventGroupId;
+        uint64 targetMarketId;
+        sint64 amount;
+    };
+    typedef QuoteNegRiskRoute_output QuoteNegRiskBuy_output;
+    struct QuoteNegRiskBuy_locals
+    {
+        QuoteNegRiskRoute_input quoteInput;
+        QuoteNegRiskRoute_output quoteOutput;
+    };
+
+    PUBLIC_FUNCTION_WITH_LOCALS(QuoteNegRiskBuy)
+    {
+        locals.quoteInput.eventGroupId = input.eventGroupId;
+        locals.quoteInput.targetMarketId = input.targetMarketId;
+        locals.quoteInput.amount = input.amount;
+        locals.quoteInput.isBuy = 1;
+        CALL(QuoteNegRiskRoute, locals.quoteInput, locals.quoteOutput);
+        output = locals.quoteOutput;
+    }
+
+    struct QuoteNegRiskSell_input
+    {
+        uint64 eventGroupId;
+        uint64 targetMarketId;
+        sint64 amount;
+    };
+    typedef QuoteNegRiskRoute_output QuoteNegRiskSell_output;
+    struct QuoteNegRiskSell_locals
+    {
+        QuoteNegRiskRoute_input quoteInput;
+        QuoteNegRiskRoute_output quoteOutput;
+    };
+
+    PUBLIC_FUNCTION_WITH_LOCALS(QuoteNegRiskSell)
+    {
+        locals.quoteInput.eventGroupId = input.eventGroupId;
+        locals.quoteInput.targetMarketId = input.targetMarketId;
+        locals.quoteInput.amount = input.amount;
+        locals.quoteInput.isBuy = 0;
+        CALL(QuoteNegRiskRoute, locals.quoteInput, locals.quoteOutput);
+        output = locals.quoteOutput;
+    }
+
+    struct BuyNegRiskPosition_input
+    {
+        uint64 eventGroupId;
+        uint64 targetMarketId;
+        sint64 amount;
+        sint64 maxGrossCost;
+    };
+    struct BuyNegRiskPosition_output
+    {
+        bit bought;
+        sint64 grossCost;
+        sint64 collateralOut;
+        sint64 netCost;
+        uint64 orderFillCount;
+    };
+    struct BuyNegRiskPosition_locals
+    {
+        uint16 i;
+        sint64 remaining;
+        sint64 fillAmount;
+        sint64 firstIndex;
+        sint64 secondIndex;
+        sint64 firstPrice;
+        sint64 secondPrice;
+        sint64 selectedPrice;
+        sint64 lineAmount;
+        uint64 userBalance;
+        uint64 contractBalance;
+        uint64 marketId;
+        bit useFirst;
+        id key;
+        id r;
+        id positionKey;
+        QtryOrder order;
+        QtryOrder position;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QtryMarketGroupLink targetLink;
+        QuoteNegRiskRoute_input quoteInput;
+        QuoteNegRiskRoute_output quoteOutput;
+        RewardTransfer_input transferInput;
+        RewardTransfer_output transferOutput;
+        UpdatePosition_input updateInput;
+        UpdatePosition_output updateOutput;
+        QuotteryTradeLogger tradeLog;
+        QuotteryNegRiskRouteLogger routeLog;
+    };
+
+    /**
+     * @brief Atomically buys YES in targetMarketId through the NegRisk route.
+     * It fills exactly amount NO shares in every other market from either NO
+     * asks or complementary YES bids, then converts the basket to target YES.
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(BuyNegRiskPosition)
+    {
+        setMemory(output, 0);
+        if (state.get().mOperationParams.mAntiSpamAmount)
+        {
+            if (qpi.invocationReward() < state.get().mOperationParams.mAntiSpamAmount) return;
+            if (qpi.invocationReward() > state.get().mOperationParams.mAntiSpamAmount)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward() - state.get().mOperationParams.mAntiSpamAmount);
+            }
+        }
+        if (input.maxGrossCost < 0) return;
+
+        locals.quoteInput.eventGroupId = input.eventGroupId;
+        locals.quoteInput.targetMarketId = input.targetMarketId;
+        locals.quoteInput.amount = input.amount;
+        locals.quoteInput.isBuy = 1;
+        CALL(QuoteNegRiskRoute, locals.quoteInput, locals.quoteOutput);
+        if (!locals.quoteOutput.fillable || locals.quoteOutput.grossAmount > input.maxGrossCost)
+        {
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets) ||
+            !state.get().mMarketGroupLink.get(input.targetMarketId, locals.targetLink))
+        {
+            return;
+        }
+
+        // Conservatively reserve one position per consumed order plus target.
+        if (state.get().mPositionInfo.population() + locals.quoteOutput.orderFillCount + 1 >
+            state.get().mPositionInfo.capacity())
+        {
+            return;
+        }
+        locals.positionKey = MakePosKey(qpi.invocator(), input.targetMarketId, QUOTTERY_RESULT_YES);
+        if (state.get().mPositionInfo.get(locals.positionKey, locals.position) &&
+            locals.position.amount > INT64_MAX - input.amount)
+        {
+            return;
+        }
+
+        // Preflight positions created for complementary YES bidders.
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (locals.i == locals.targetLink.marketIndex) continue;
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            locals.remaining = input.amount;
+            locals.key = MakeOrderKey(locals.marketId, QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, locals.r);
+            locals.firstIndex = state.get().mABOrders.headIndex(locals.key);
+            locals.key = MakeOrderKey(locals.marketId, QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, locals.r);
+            locals.secondIndex = state.get().mABOrders.headIndex(locals.key);
+            while (locals.remaining > 0)
+            {
+                locals.firstPrice = state.get().wholeSharePrice + 1;
+                locals.secondPrice = state.get().wholeSharePrice + 1;
+                if (locals.firstIndex != NULL_INDEX)
+                {
+                    locals.firstPrice = -state.get().mABOrders.priority(locals.firstIndex);
+                }
+                if (locals.secondIndex != NULL_INDEX)
+                {
+                    locals.secondPrice = state.get().wholeSharePrice -
+                        state.get().mABOrders.priority(locals.secondIndex);
+                }
+                locals.useFirst = locals.firstPrice <= locals.secondPrice;
+                if (locals.useFirst)
+                {
+                    locals.order = state.get().mABOrders.element(locals.firstIndex);
+                    locals.fillAmount = min(locals.remaining, locals.order.amount);
+                    if (locals.fillAmount == locals.order.amount)
+                    {
+                        locals.firstIndex = state.get().mABOrders.nextElementIndex(locals.firstIndex);
+                    }
+                }
+                else
+                {
+                    locals.order = state.get().mABOrders.element(locals.secondIndex);
+                    locals.positionKey = MakePosKey(locals.order.entity, locals.marketId, QUOTTERY_RESULT_YES);
+                    if (state.get().mPositionInfo.get(locals.positionKey, locals.position) &&
+                        locals.position.amount > INT64_MAX - input.amount)
+                    {
+                        return;
+                    }
+                    locals.fillAmount = min(locals.remaining, locals.order.amount);
+                    if (locals.fillAmount == locals.order.amount)
+                    {
+                        locals.secondIndex = state.get().mABOrders.nextElementIndex(locals.secondIndex);
+                    }
+                }
+                locals.remaining -= locals.fillAmount;
+            }
+        }
+
+        locals.userBalance = qpi.numberOfShares(
+            state.get().mQUSDIdentifier,
+            { qpi.invocator(), SELF_INDEX },
+            { qpi.invocator(), SELF_INDEX });
+        locals.contractBalance = qpi.numberOfShares(
+            state.get().mQUSDIdentifier,
+            { SELF, SELF_INDEX },
+            { SELF, SELF_INDEX });
+        if (locals.userBalance < (uint64)locals.quoteOutput.grossAmount ||
+            locals.contractBalance < (uint64)locals.quoteOutput.collateralAmount)
+        {
+            return;
+        }
+        if (locals.quoteOutput.grossAmount &&
+            qpi.transferShareOwnershipAndPossession(
+                state.get().mQUSDIdentifier.assetName,
+                state.get().mQUSDIdentifier.issuer,
+                qpi.invocator(),
+                qpi.invocator(),
+                locals.quoteOutput.grossAmount,
+                SELF) < 0)
+        {
+            return;
+        }
+
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (locals.i == locals.targetLink.marketIndex) continue;
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            locals.remaining = input.amount;
+            while (locals.remaining > 0)
+            {
+                locals.key = MakeOrderKey(locals.marketId, QUOTTERY_RESULT_NO, QUOTTERY_ASK_BIT, locals.r);
+                locals.firstIndex = state.get().mABOrders.headIndex(locals.key);
+                locals.key = MakeOrderKey(locals.marketId, QUOTTERY_RESULT_YES, QUOTTERY_BID_BIT, locals.r);
+                locals.secondIndex = state.get().mABOrders.headIndex(locals.key);
+                locals.firstPrice = state.get().wholeSharePrice + 1;
+                locals.secondPrice = state.get().wholeSharePrice + 1;
+                if (locals.firstIndex != NULL_INDEX)
+                {
+                    locals.firstPrice = -state.get().mABOrders.priority(locals.firstIndex);
+                }
+                if (locals.secondIndex != NULL_INDEX)
+                {
+                    locals.secondPrice = state.get().wholeSharePrice -
+                        state.get().mABOrders.priority(locals.secondIndex);
+                }
+                locals.useFirst = locals.firstPrice <= locals.secondPrice;
+                if (locals.useFirst)
+                {
+                    locals.order = state.get().mABOrders.element(locals.firstIndex);
+                    locals.selectedPrice = locals.firstPrice;
+                }
+                else
+                {
+                    locals.order = state.get().mABOrders.element(locals.secondIndex);
+                    locals.selectedPrice = locals.secondPrice;
+                }
+                locals.fillAmount = min(locals.remaining, locals.order.amount);
+                locals.lineAmount = locals.fillAmount * locals.selectedPrice;
+
+                if (locals.useFirst)
+                {
+                    locals.transferInput.amount = locals.lineAmount;
+                    locals.transferInput.eid = locals.marketId;
+                    locals.transferInput.receiver = locals.order.entity;
+                    locals.transferInput.needChargeFee = 1;
+                    CALL(RewardTransfer, locals.transferInput, locals.transferOutput);
+                    if (!locals.transferOutput.ok) return;
+
+                    locals.tradeLog = QuotteryTradeLogger{
+                        0, QUOTTERY_MATCH_TYPE_0, locals.order.entity, qpi.invocator(),
+                        locals.marketId, QUOTTERY_RESULT_NO, 0, 0,
+                        locals.fillAmount, locals.selectedPrice, 0, 0
+                    };
+                    LOG_INFO(locals.tradeLog);
+                    locals.order.amount -= locals.fillAmount;
+                    if (locals.order.amount)
+                    {
+                        state.mut().mABOrders.replace(locals.firstIndex, locals.order);
+                    }
+                    else
+                    {
+                        state.mut().mABOrders.remove(locals.firstIndex);
+                    }
+                }
+                else
+                {
+                    locals.updateInput.uid = locals.order.entity;
+                    locals.updateInput.amountChange = locals.fillAmount;
+                    locals.updateInput.oi.eid = locals.marketId;
+                    locals.updateInput.oi.option = QUOTTERY_RESULT_YES;
+                    locals.updateInput.oi.tradeBit = QUOTTERY_BID_BIT;
+                    CALL(UpdatePosition, locals.updateInput, locals.updateOutput);
+                    if (!locals.updateOutput.ok) return;
+
+                    locals.tradeLog = QuotteryTradeLogger{
+                        0, QUOTTERY_MATCH_TYPE_3, qpi.invocator(), locals.order.entity,
+                        locals.marketId, 2, 0, 0, locals.fillAmount,
+                        locals.selectedPrice, state.get().wholeSharePrice - locals.selectedPrice, 0
+                    };
+                    LOG_INFO(locals.tradeLog);
+                    locals.order.amount -= locals.fillAmount;
+                    if (locals.order.amount)
+                    {
+                        state.mut().mABOrders.replace(locals.secondIndex, locals.order);
+                    }
+                    else
+                    {
+                        state.mut().mABOrders.remove(locals.secondIndex);
+                    }
+                }
+                locals.remaining -= locals.fillAmount;
+            }
+        }
+
+        locals.updateInput.uid = qpi.invocator();
+        locals.updateInput.amountChange = input.amount;
+        locals.updateInput.oi.eid = input.targetMarketId;
+        locals.updateInput.oi.option = QUOTTERY_RESULT_YES;
+        locals.updateInput.oi.tradeBit = QUOTTERY_BID_BIT;
+        CALL(UpdatePosition, locals.updateInput, locals.updateOutput);
+        if (!locals.updateOutput.ok) return;
+
+        if (locals.quoteOutput.collateralAmount)
+        {
+            locals.transferInput.amount = locals.quoteOutput.collateralAmount;
+            locals.transferInput.eid = input.targetMarketId;
+            locals.transferInput.receiver = qpi.invocator();
+            locals.transferInput.needChargeFee = 0;
+            CALL(RewardTransfer, locals.transferInput, locals.transferOutput);
+            if (!locals.transferOutput.ok) return;
+        }
+
+        output.bought = 1;
+        output.grossCost = locals.quoteOutput.grossAmount;
+        output.collateralOut = locals.quoteOutput.collateralAmount;
+        output.netCost = locals.quoteOutput.netAmountBeforeFees;
+        output.orderFillCount = locals.quoteOutput.orderFillCount;
+        locals.routeLog = QuotteryNegRiskRouteLogger{
+            0, QUOTTERY_BOUGHT_NEG_RISK_POSITION, qpi.invocator(),
+            input.eventGroupId, input.targetMarketId, input.amount,
+            output.grossCost, output.collateralOut, output.orderFillCount, 0
+        };
+        LOG_INFO(locals.routeLog);
+    }
+
+    struct SellNegRiskPosition_input
+    {
+        uint64 eventGroupId;
+        uint64 targetMarketId;
+        sint64 amount;
+        sint64 minGrossProceeds;
+    };
+    struct SellNegRiskPosition_output
+    {
+        bit sold;
+        sint64 grossProceeds;
+        sint64 collateralIn;
+        sint64 netProceedsBeforeFees;
+        uint64 orderFillCount;
+    };
+    struct SellNegRiskPosition_locals
+    {
+        uint16 i;
+        sint64 remaining;
+        sint64 fillAmount;
+        sint64 firstIndex;
+        sint64 secondIndex;
+        sint64 firstPrice;
+        sint64 secondPrice;
+        sint64 selectedPrice;
+        sint64 lineAmount;
+        sint64 yesPrice;
+        sint64 requiredPayout;
+        uint64 userBalance;
+        uint64 contractBalance;
+        uint64 marketId;
+        bit useFirst;
+        id key;
+        id r;
+        id positionKey;
+        QtryOrder order;
+        QtryOrder position;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        QtryMarketGroupLink targetLink;
+        QuoteNegRiskRoute_input quoteInput;
+        QuoteNegRiskRoute_output quoteOutput;
+        RewardTransfer_input transferInput;
+        RewardTransfer_output transferOutput;
+        UpdatePosition_input updateInput;
+        UpdatePosition_output updateOutput;
+        QuotteryTradeLogger tradeLog;
+        QuotteryNegRiskRouteLogger routeLog;
+    };
+
+    /**
+     * @brief Atomically sells target YES through its equivalent NO basket. The
+     * caller supplies (N-2) collateral sets; the procedure fills NO demand in
+     * every other market and consumes the target YES position.
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(SellNegRiskPosition)
+    {
+        setMemory(output, 0);
+        if (state.get().mOperationParams.mAntiSpamAmount)
+        {
+            if (qpi.invocationReward() < state.get().mOperationParams.mAntiSpamAmount) return;
+            if (qpi.invocationReward() > state.get().mOperationParams.mAntiSpamAmount)
+            {
+                qpi.transfer(qpi.invocator(), qpi.invocationReward() - state.get().mOperationParams.mAntiSpamAmount);
+            }
+        }
+        if (input.minGrossProceeds < 0) return;
+
+        locals.quoteInput.eventGroupId = input.eventGroupId;
+        locals.quoteInput.targetMarketId = input.targetMarketId;
+        locals.quoteInput.amount = input.amount;
+        locals.quoteInput.isBuy = 0;
+        CALL(QuoteNegRiskRoute, locals.quoteInput, locals.quoteOutput);
+        if (!locals.quoteOutput.fillable ||
+            locals.quoteOutput.grossAmount < input.minGrossProceeds)
+        {
+            return;
+        }
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets) ||
+            !state.get().mMarketGroupLink.get(input.targetMarketId, locals.targetLink))
+        {
+            return;
+        }
+
+        locals.positionKey = MakePosKey(qpi.invocator(), input.targetMarketId, QUOTTERY_RESULT_YES);
+        if (!state.get().mPositionInfo.get(locals.positionKey, locals.position) ||
+            locals.position.amount < input.amount)
+        {
+            return;
+        }
+        if (state.get().mPositionInfo.population() + locals.quoteOutput.orderFillCount >
+            state.get().mPositionInfo.capacity())
+        {
+            return;
+        }
+
+        // Preflight positions created for direct NO bidders.
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (locals.i == locals.targetLink.marketIndex) continue;
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            locals.remaining = input.amount;
+            locals.key = MakeOrderKey(locals.marketId, QUOTTERY_RESULT_NO, QUOTTERY_BID_BIT, locals.r);
+            locals.firstIndex = state.get().mABOrders.headIndex(locals.key);
+            locals.key = MakeOrderKey(locals.marketId, QUOTTERY_RESULT_YES, QUOTTERY_ASK_BIT, locals.r);
+            locals.secondIndex = state.get().mABOrders.headIndex(locals.key);
+            while (locals.remaining > 0)
+            {
+                locals.firstPrice = -1;
+                locals.secondPrice = -1;
+                if (locals.firstIndex != NULL_INDEX)
+                {
+                    locals.firstPrice = state.get().mABOrders.priority(locals.firstIndex);
+                }
+                if (locals.secondIndex != NULL_INDEX)
+                {
+                    locals.secondPrice = state.get().wholeSharePrice +
+                        state.get().mABOrders.priority(locals.secondIndex);
+                }
+                locals.useFirst = locals.firstPrice >= locals.secondPrice;
+                if (locals.useFirst)
+                {
+                    locals.order = state.get().mABOrders.element(locals.firstIndex);
+                    locals.positionKey = MakePosKey(
+                        locals.order.entity, locals.marketId, QUOTTERY_RESULT_NO);
+                    if (state.get().mPositionInfo.get(locals.positionKey, locals.position) &&
+                        locals.position.amount > INT64_MAX - input.amount)
+                    {
+                        return;
+                    }
+                    locals.fillAmount = min(locals.remaining, locals.order.amount);
+                    locals.lineAmount = locals.fillAmount * locals.firstPrice;
+                    if (locals.fillAmount == locals.order.amount)
+                    {
+                        locals.firstIndex = state.get().mABOrders.nextElementIndex(locals.firstIndex);
+                    }
+                }
+                else
+                {
+                    locals.order = state.get().mABOrders.element(locals.secondIndex);
+                    locals.fillAmount = min(locals.remaining, locals.order.amount);
+                    locals.lineAmount = locals.fillAmount * state.get().wholeSharePrice;
+                    if (locals.fillAmount == locals.order.amount)
+                    {
+                        locals.secondIndex = state.get().mABOrders.nextElementIndex(locals.secondIndex);
+                    }
+                }
+                if (locals.requiredPayout > MAX_AMOUNT - locals.lineAmount) return;
+                locals.requiredPayout += locals.lineAmount;
+                locals.remaining -= locals.fillAmount;
+            }
+        }
+
+        locals.userBalance = qpi.numberOfShares(
+            state.get().mQUSDIdentifier,
+            { qpi.invocator(), SELF_INDEX },
+            { qpi.invocator(), SELF_INDEX });
+        if (locals.userBalance < (uint64)locals.quoteOutput.collateralAmount) return;
+
+        locals.contractBalance = qpi.numberOfShares(
+            state.get().mQUSDIdentifier,
+            { SELF, SELF_INDEX },
+            { SELF, SELF_INDEX });
+        if (locals.requiredPayout > locals.quoteOutput.collateralAmount &&
+            locals.contractBalance <
+                (uint64)(locals.requiredPayout - locals.quoteOutput.collateralAmount))
+        {
+            return;
+        }
+
+        if (locals.quoteOutput.collateralAmount &&
+            qpi.transferShareOwnershipAndPossession(
+                state.get().mQUSDIdentifier.assetName,
+                state.get().mQUSDIdentifier.issuer,
+                qpi.invocator(),
+                qpi.invocator(),
+                locals.quoteOutput.collateralAmount,
+                SELF) < 0)
+        {
+            return;
+        }
+
+        locals.positionKey = MakePosKey(
+            qpi.invocator(), input.targetMarketId, QUOTTERY_RESULT_YES);
+        if (!state.get().mPositionInfo.get(locals.positionKey, locals.position) ||
+            locals.position.amount < input.amount)
+        {
+            return;
+        }
+        locals.position.amount -= input.amount;
+        if (locals.position.amount)
+        {
+            state.mut().mPositionInfo.set(locals.positionKey, locals.position);
+        }
+        else
+        {
+            state.mut().mPositionInfo.removeByKey(locals.positionKey);
+        }
+
+        for (locals.i = 0; locals.i < locals.eventGroupInfo.marketCount; locals.i++)
+        {
+            if (locals.i == locals.targetLink.marketIndex) continue;
+            locals.marketId = locals.markets.marketIds.get(locals.i);
+            locals.remaining = input.amount;
+            while (locals.remaining > 0)
+            {
+                locals.key = MakeOrderKey(locals.marketId, QUOTTERY_RESULT_NO, QUOTTERY_BID_BIT, locals.r);
+                locals.firstIndex = state.get().mABOrders.headIndex(locals.key);
+                locals.key = MakeOrderKey(locals.marketId, QUOTTERY_RESULT_YES, QUOTTERY_ASK_BIT, locals.r);
+                locals.secondIndex = state.get().mABOrders.headIndex(locals.key);
+                locals.firstPrice = -1;
+                locals.secondPrice = -1;
+                if (locals.firstIndex != NULL_INDEX)
+                {
+                    locals.firstPrice = state.get().mABOrders.priority(locals.firstIndex);
+                }
+                if (locals.secondIndex != NULL_INDEX)
+                {
+                    locals.secondPrice = state.get().wholeSharePrice +
+                        state.get().mABOrders.priority(locals.secondIndex);
+                }
+                locals.useFirst = locals.firstPrice >= locals.secondPrice;
+                if (locals.useFirst)
+                {
+                    locals.order = state.get().mABOrders.element(locals.firstIndex);
+                    locals.selectedPrice = locals.firstPrice;
+                }
+                else
+                {
+                    locals.order = state.get().mABOrders.element(locals.secondIndex);
+                    locals.selectedPrice = locals.secondPrice;
+                }
+                locals.fillAmount = min(locals.remaining, locals.order.amount);
+                locals.lineAmount = locals.fillAmount * locals.selectedPrice;
+
+                if (locals.lineAmount)
+                {
+                    locals.transferInput.amount = locals.lineAmount;
+                    locals.transferInput.eid = locals.marketId;
+                    locals.transferInput.receiver = qpi.invocator();
+                    locals.transferInput.needChargeFee = 1;
+                    CALL(RewardTransfer, locals.transferInput, locals.transferOutput);
+                    if (!locals.transferOutput.ok) return;
+                }
+
+                if (locals.useFirst)
+                {
+                    locals.updateInput.uid = locals.order.entity;
+                    locals.updateInput.amountChange = locals.fillAmount;
+                    locals.updateInput.oi.eid = locals.marketId;
+                    locals.updateInput.oi.option = QUOTTERY_RESULT_NO;
+                    locals.updateInput.oi.tradeBit = QUOTTERY_BID_BIT;
+                    CALL(UpdatePosition, locals.updateInput, locals.updateOutput);
+                    if (!locals.updateOutput.ok) return;
+
+                    locals.tradeLog = QuotteryTradeLogger{
+                        0, QUOTTERY_MATCH_TYPE_0, qpi.invocator(), locals.order.entity,
+                        locals.marketId, QUOTTERY_RESULT_NO, 0, 0,
+                        locals.fillAmount, locals.selectedPrice, 0, 0
+                    };
+                    LOG_INFO(locals.tradeLog);
+                    locals.order.amount -= locals.fillAmount;
+                    if (locals.order.amount)
+                    {
+                        state.mut().mABOrders.replace(locals.firstIndex, locals.order);
+                    }
+                    else
+                    {
+                        state.mut().mABOrders.remove(locals.firstIndex);
+                    }
+                }
+                else
+                {
+                    locals.yesPrice = state.get().wholeSharePrice - locals.selectedPrice;
+                    locals.transferInput.amount = locals.fillAmount * locals.yesPrice;
+                    locals.transferInput.eid = locals.marketId;
+                    locals.transferInput.receiver = locals.order.entity;
+                    locals.transferInput.needChargeFee = 1;
+                    CALL(RewardTransfer, locals.transferInput, locals.transferOutput);
+                    if (!locals.transferOutput.ok) return;
+
+                    locals.tradeLog = QuotteryTradeLogger{
+                        0, QUOTTERY_MATCH_TYPE_2, qpi.invocator(), locals.order.entity,
+                        locals.marketId, 2, 0, 0, locals.fillAmount,
+                        locals.selectedPrice, locals.yesPrice, 0
+                    };
+                    LOG_INFO(locals.tradeLog);
+                    locals.order.amount -= locals.fillAmount;
+                    if (locals.order.amount)
+                    {
+                        state.mut().mABOrders.replace(locals.secondIndex, locals.order);
+                    }
+                    else
+                    {
+                        state.mut().mABOrders.remove(locals.secondIndex);
+                    }
+                }
+                locals.remaining -= locals.fillAmount;
+            }
+        }
+
+        output.sold = 1;
+        output.grossProceeds = locals.quoteOutput.grossAmount;
+        output.collateralIn = locals.quoteOutput.collateralAmount;
+        output.netProceedsBeforeFees = locals.quoteOutput.netAmountBeforeFees;
+        output.orderFillCount = locals.quoteOutput.orderFillCount;
+        locals.routeLog = QuotteryNegRiskRouteLogger{
+            0, QUOTTERY_SOLD_NEG_RISK_POSITION, qpi.invocator(),
+            input.eventGroupId, input.targetMarketId, input.amount,
+            output.grossProceeds, output.collateralIn, output.orderFillCount, 0
+        };
+        LOG_INFO(locals.routeLog);
+    }
+
+    struct MatchEventGroupOrders_input
+    {
+        uint64 eventGroupId;
+        uint64 maxOrderFills;
+    };
+
+    struct MatchEventGroupOrders_output
+    {
+        uint64 mintOrderFillCount;
+        uint64 mergeOrderFillCount;
+        uint64 mintMatchCount;
+        uint64 mergeMatchCount;
+    };
+
+    struct MatchEventGroupOrders_locals
+    {
+        uint64 maxOrderFills;
+        QtryEventGroupInfo eventGroupInfo;
+        QtryEventGroupMarkets markets;
+        MatchingEventGroupOrders_input matchInput;
+        MatchingEventGroupOrders_output matchOutput;
+    };
+
+    /**
+     * @brief Permissionless bounded crank for complete-set group MINT/MERGE.
+     * Normal order placement invokes the same matcher automatically; this
+     * procedure lets any caller retry old resting books without controlling
+     * settlement prices or recipients.
+     */
+    PUBLIC_PROCEDURE_WITH_LOCALS(MatchEventGroupOrders)
+    {
+        setMemory(output, 0);
+        if (state.get().mOperationParams.mAntiSpamAmount)
+        {
+            if (qpi.invocationReward() < state.get().mOperationParams.mAntiSpamAmount) return;
+            if (qpi.invocationReward() > state.get().mOperationParams.mAntiSpamAmount)
+            {
+                qpi.transfer(
+                    qpi.invocator(),
+                    qpi.invocationReward() - state.get().mOperationParams.mAntiSpamAmount);
+            }
+        }
+
+        if (!state.get().mEventGroupInfo.get(input.eventGroupId, locals.eventGroupInfo) ||
+            !state.get().mEventGroupMarkets.get(input.eventGroupId, locals.markets) ||
+            locals.eventGroupInfo.marketCount < 2)
+        {
+            return;
+        }
+
+        locals.maxOrderFills = input.maxOrderFills;
+        if (locals.maxOrderFills == 0 ||
+            locals.maxOrderFills > QUOTTERY_MAX_NEG_RISK_ORDER_FILLS)
+        {
+            locals.maxOrderFills = QUOTTERY_MAX_NEG_RISK_ORDER_FILLS;
+        }
+
+        locals.matchInput.eventGroupId = input.eventGroupId;
+        locals.matchInput.preferredMarketId = locals.markets.marketIds.get(0);
+        locals.matchInput.maxOrderFills = locals.maxOrderFills;
+        locals.matchInput.isBid = 1;
+        CALL(MatchingEventGroupOrders, locals.matchInput, locals.matchOutput);
+        output.mintOrderFillCount = locals.matchOutput.orderFillCount;
+        output.mintMatchCount = locals.matchOutput.matchCount;
+
+        if (output.mintOrderFillCount < locals.maxOrderFills)
+        {
+            locals.matchInput.maxOrderFills =
+                locals.maxOrderFills - output.mintOrderFillCount;
+            locals.matchInput.isBid = 0;
+            CALL(MatchingEventGroupOrders, locals.matchInput, locals.matchOutput);
+            output.mergeOrderFillCount = locals.matchOutput.orderFillCount;
+            output.mergeMatchCount = locals.matchOutput.matchCount;
+        }
+    }
+
     struct PublishResult_locals
     {
         QtryEventInfo qei;
@@ -3234,6 +4912,8 @@ public:
         REGISTER_USER_FUNCTION(GetEventGroup, 9);
         REGISTER_USER_FUNCTION(GetMarketEventGroup, 10);
         REGISTER_USER_FUNCTION(GetEventGroupInfoBatch, 11);
+        REGISTER_USER_FUNCTION(QuoteNegRiskBuy, 12);
+        REGISTER_USER_FUNCTION(QuoteNegRiskSell, 13);
 
         REGISTER_USER_PROCEDURE(CreateEvent, 1);
         REGISTER_USER_PROCEDURE(AddToAskOrder, 2);
@@ -3262,6 +4942,11 @@ public:
         REGISTER_USER_PROCEDURE(DisputeEventResult, 34);
         REGISTER_USER_PROCEDURE(ResolveEventDispute, 35);
         REGISTER_USER_PROCEDURE(CancelEventGroup, 36);
+        REGISTER_USER_PROCEDURE(ConvertNegRiskPositions, 37);
+        REGISTER_USER_PROCEDURE(ReverseNegRiskPositions, 38);
+        REGISTER_USER_PROCEDURE(BuyNegRiskPosition, 39);
+        REGISTER_USER_PROCEDURE(SellNegRiskPosition, 40);
+        REGISTER_USER_PROCEDURE(MatchEventGroupOrders, 41);
 
         // Shareholder proposals: use standard function/procedure indices
         REGISTER_USER_PROCEDURE(ProposalVote, 100);
