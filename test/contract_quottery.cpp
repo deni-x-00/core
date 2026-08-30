@@ -22,6 +22,11 @@ static void updateEtalonTime(uint64 offsetSecond)
     system.tick = etalonTick.tick;
 }
 
+static id lostGODepositRecoveryRecipient()
+{
+    return ID(_P, _R, _E, _D, _P, _W, _E, _P, _W, _I, _J, _U, _X, _B, _L, _W, _N, _C, _G, _Q, _S, _H, _L, _R, _U, _G, _V, _C, _D, _A, _N, _P, _O, _H, _C, _Y, _H, _K, _Z, _Y, _A, _E, _V, _I, _B, _E, _A, _O, _R, _R, _A, _O, _W, _F, _A, _H);
+}
+
 class ContractTestingQtry : public ContractTesting 
 {
 public:
@@ -79,6 +84,23 @@ public:
         QpiContextUserProcedureCall qpi(QUOTTERY_CONTRACT_INDEX, from, 0);
         qpi.transferShareOwnershipAndPossession(state->mQUSDIdentifier.assetName, state->mQUSDIdentifier.issuer, from, from, amount, to);
         qpi.freeBuffer();
+    }
+
+    bool transferQUByStandardTransaction(const id& from, sint64 amount)
+    {
+        const int senderSpectrumIndex = spectrumIndex(from);
+        if (senderSpectrumIndex < 0 || !decreaseEnergy(senderSpectrumIndex, amount))
+        {
+            return false;
+        }
+
+        const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+        increaseEnergy(contractId, amount);
+
+        QpiContextSystemProcedureCall qpi(QUOTTERY_CONTRACT_INDEX, POST_INCOMING_TRANSFER);
+        QPI::PostIncomingTransfer_input input{ from, amount, QPI::TransferType::standardTransaction };
+        qpi.call(input);
+        return contractError[QUOTTERY_CONTRACT_INDEX] == 0;
     }
 
     long long balanceUSD(id pk)
@@ -180,6 +202,7 @@ public:
         pri.eventId = eid;
         invokeUserProcedure(QUOTTERY_CONTRACT_INDEX, 7, pri, pro, caller, 0);
     }
+
     void UserClaimReward(const uint64 eid, const id caller)
     {
         QUOTTERY::UserClaimReward_input pri;
@@ -2369,6 +2392,264 @@ TEST(QTRYTest, Automatic_Cleanup_Lifecycle)
     // Safety check: other maps should definitely be gone too
     QUOTTERY::DepositInfo di;
     EXPECT_FALSE(state->mDisputeInfo.get(eventId, di));
+}
+
+TEST(QTRYTest, CleanMemoryFinalizesEmptyEventAndReturnsGODeposit)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+    const sint64 deposit = 1000000;
+    state->mQtryGov.mDepositAmountForDispute = deposit;
+
+    QUOTTERY::CreateEvent_input createInput;
+    DateAndTime endDate = wrapped_now();
+    createInput.qei.eid = -1;
+    createInput.qei.endDate = endDate;
+    createInput.qei.endDate.addMicrosec(3600000000ULL);
+    qtry.CreateEvent(createInput, operationId, state->mQtryGov.mFeePerDay);
+
+    updateEtalonTime(7200);
+    increaseEnergy(operationId, deposit);
+    qtry.PublishResult(0, QUOTTERY_RESULT_YES, operationId, deposit);
+
+    QUOTTERY::DepositInfo depositInfo;
+    EXPECT_TRUE(state->mGODepositInfo.get(0, depositInfo));
+    const sint64 operationBalanceBeforeCleanup = getBalance(operationId);
+
+    updateEtalonTime(100000);
+    qtry.endEpoch();
+
+    EXPECT_GE(getBalance(operationId) - operationBalanceBeforeCleanup, deposit);
+    EXPECT_FALSE(state->mGODepositInfo.contains(0));
+    EXPECT_FALSE(state->mEventInfo.contains(0));
+    EXPECT_FALSE(state->mEventResult.contains(0));
+    EXPECT_FALSE(state->mEventFinalFlag.contains(0));
+}
+
+TEST(QTRYTest, CleanMemoryRecoversFinalizedEventWithPendingGODeposit)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+    const sint64 deposit = 1000000;
+    state->mQtryGov.mDepositAmountForDispute = deposit;
+
+    QUOTTERY::CreateEvent_input createInput;
+    DateAndTime endDate = wrapped_now();
+    createInput.qei.eid = -1;
+    createInput.qei.endDate = endDate;
+    createInput.qei.endDate.addMicrosec(3600000000ULL);
+    qtry.CreateEvent(createInput, operationId, state->mQtryGov.mFeePerDay);
+
+    id bidder = id::randomValue();
+    increaseEnergy(bidder, 1000000);
+    qtry.transferQUSD(qtry.owner, bidder, 1000000);
+    qtry.AddBidOrder(0, 2, 0, 10000, bidder);
+    const id bidKey = qtry.MakeOrderKey(0, 0, QUOTTERY_BID_BIT, id());
+    EXPECT_NE(state->mABOrders.headIndex(bidKey), (sint64)NULL_INDEX);
+
+    updateEtalonTime(7200);
+    increaseEnergy(operationId, deposit);
+    qtry.PublishResult(0, QUOTTERY_RESULT_NO, operationId, deposit);
+    updateEtalonTime(100000);
+
+    // Reproduce the legacy state: finalized flag was set but the deposit entry
+    // was never paid and is still held by the contract.
+    state->mEventFinalFlag.set(0, true);
+    EXPECT_TRUE(state->mGODepositInfo.contains(0));
+    const sint64 operationBalanceBeforeCleanup = getBalance(operationId);
+
+    qtry.endEpoch();
+
+    EXPECT_GE(getBalance(operationId) - operationBalanceBeforeCleanup, deposit);
+    EXPECT_FALSE(state->mGODepositInfo.contains(0));
+    EXPECT_TRUE(state->mEventInfo.contains(0));
+    EXPECT_TRUE(state->mEventFinalFlag.contains(0));
+    EXPECT_EQ(state->mABOrders.headIndex(bidKey), (sint64)NULL_INDEX);
+
+    // Archive is intentionally deferred because FinalizeEvent may have restored
+    // ask positions after the payout phase had already run.
+    qtry.endEpoch();
+    EXPECT_FALSE(state->mEventInfo.contains(0));
+    EXPECT_FALSE(state->mEventFinalFlag.contains(0));
+}
+
+TEST(QTRYTest, CleanMemoryRetriesFailedGODepositTransfer)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id operationId = state->mQtryGov.mOperationId;
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    const sint64 deposit = 1000000;
+    state->mQtryGov.mDepositAmountForDispute = deposit;
+
+    QUOTTERY::CreateEvent_input createInput;
+    DateAndTime endDate = wrapped_now();
+    createInput.qei.eid = -1;
+    createInput.qei.endDate = endDate;
+    createInput.qei.endDate.addMicrosec(3600000000ULL);
+    qtry.CreateEvent(createInput, operationId, state->mQtryGov.mFeePerDay);
+
+    updateEtalonTime(7200);
+    increaseEnergy(operationId, deposit);
+    qtry.PublishResult(0, QUOTTERY_RESULT_YES, operationId, deposit);
+    updateEtalonTime(100000);
+
+    const int contractSpectrumIndex = spectrumIndex(contractId);
+    ASSERT_GE(contractSpectrumIndex, 0);
+    ASSERT_TRUE(decreaseEnergy(contractSpectrumIndex, getBalance(contractId)));
+
+    qtry.endEpoch();
+
+    // Failed transfer must preserve every state item needed for a retry.
+    EXPECT_TRUE(state->mGODepositInfo.contains(0));
+    EXPECT_TRUE(state->mEventInfo.contains(0));
+    EXPECT_TRUE(state->mEventResult.contains(0));
+    EXPECT_FALSE(state->mEventFinalFlag.contains(0));
+
+    increaseEnergy(contractId, deposit);
+    const sint64 operationBalanceBeforeRetry = getBalance(operationId);
+    qtry.endEpoch();
+
+    EXPECT_GE(getBalance(operationId) - operationBalanceBeforeRetry, deposit);
+    EXPECT_FALSE(state->mGODepositInfo.contains(0));
+    EXPECT_FALSE(state->mEventInfo.contains(0));
+    EXPECT_FALSE(state->mEventFinalFlag.contains(0));
+}
+
+TEST(QTRYTest, BeginEpochRecoversLostGODepositForEvent277ExactlyOnce)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id receiver = lostGODepositRecoveryRecipient();
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    const sint64 deposit = QUOTTERY_LOST_GO_DEPOSIT_AMOUNT;
+
+    state->mCurrentEventID = QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID + 1;
+    // Mutable governance must have no influence on this historical recovery.
+    state->mQtryGov.mOperationId = id::randomValue();
+    state->mQtryGov.mDepositAmountForDispute = deposit - 1;
+    increaseEnergy(receiver, 1);
+    increaseEnergy(contractId, deposit);
+
+    const sint64 receiverBalanceBefore = getBalance(receiver);
+    const sint64 contractBalanceBefore = getBalance(contractId);
+    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH;
+    qtry.beginEpoch();
+
+    EXPECT_TRUE(state->mLostGODeposit277Recovered);
+    EXPECT_EQ(getBalance(receiver) - receiverBalanceBefore, deposit);
+    EXPECT_EQ(contractBalanceBefore - getBalance(contractId), deposit);
+
+    // Funding the contract again proves that the state flag, rather than a low
+    // contract balance, prevents a second payout.
+    increaseEnergy(contractId, deposit);
+    const sint64 receiverBalanceBeforeSecondCall = getBalance(receiver);
+    qtry.beginEpoch();
+
+    EXPECT_EQ(getBalance(receiver), receiverBalanceBeforeSecondCall);
+}
+
+TEST(QTRYTest, BeginEpochRecoveryRejectsWrongEpochOrUnsafeState)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id receiver = lostGODepositRecoveryRecipient();
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    const sint64 deposit = QUOTTERY_LOST_GO_DEPOSIT_AMOUNT;
+
+    state->mCurrentEventID = QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID + 1;
+    state->mQtryGov.mOperationId = id::randomValue();
+    increaseEnergy(receiver, 1);
+    increaseEnergy(contractId, deposit);
+
+    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH + 1;
+    qtry.beginEpoch();
+    EXPECT_FALSE(state->mLostGODeposit277Recovered);
+    EXPECT_EQ(getBalance(contractId), deposit);
+
+    QUOTTERY::QtryEventInfo eventInfo;
+    setMemory(eventInfo, 0);
+    eventInfo.eid = QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID;
+    state->mEventInfo.set(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID, eventInfo);
+    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH;
+    qtry.beginEpoch();
+    EXPECT_FALSE(state->mLostGODeposit277Recovered);
+    EXPECT_EQ(getBalance(contractId), deposit);
+}
+
+TEST(QTRYTest, BeginEpochRecoveryDoesNotRunAfterConfiguredEpoch)
+{
+    ContractTestingQtry qtry;
+    auto state = qtry.getState();
+    const id receiver = lostGODepositRecoveryRecipient();
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    const sint64 deposit = QUOTTERY_LOST_GO_DEPOSIT_AMOUNT;
+
+    state->mCurrentEventID = QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID + 1;
+    increaseEnergy(receiver, 1);
+    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH;
+    qtry.beginEpoch();
+
+    EXPECT_FALSE(state->mLostGODeposit277Recovered);
+
+    increaseEnergy(contractId, deposit);
+    const sint64 receiverBalanceBefore = getBalance(receiver);
+    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH + 1;
+    qtry.beginEpoch();
+
+    EXPECT_FALSE(state->mLostGODeposit277Recovered);
+    EXPECT_EQ(getBalance(receiver), receiverBalanceBefore);
+    EXPECT_EQ(getBalance(contractId), deposit);
+}
+
+TEST(QTRYTest, DirectQUTransferBurnsOnePercentAndRefundsTheRest)
+{
+    ContractTestingQtry qtry;
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    const id sender = id::randomValue();
+    const sint64 amount = 123456789;
+    const sint64 expectedFee = amount / QUOTTERY_DIRECT_TRANSFER_REFUND_FEE_DIVISOR;
+    const sint64 expectedRefund = amount - expectedFee;
+    const sint64 feeReserveBefore = getContractFeeReserve(QUOTTERY_CONTRACT_INDEX);
+
+    increaseEnergy(sender, amount);
+    ASSERT_TRUE(qtry.transferQUByStandardTransaction(sender, amount));
+
+    EXPECT_EQ(getBalance(sender), expectedRefund);
+    EXPECT_EQ(getBalance(contractId), 0);
+    EXPECT_EQ(getContractFeeReserve(QUOTTERY_CONTRACT_INDEX) - feeReserveBefore, expectedFee);
+}
+
+TEST(QTRYTest, DirectQUTransferUsesAllOrNothingMinimumFee)
+{
+    ContractTestingQtry qtry;
+    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
+    const sint64 belowThresholdAmount = 9999999;
+    const sint64 thresholdAmount = 10000000;
+    const sint64 thresholdFee = QUOTTERY_MIN_DIRECT_TRANSFER_REFUND_FEE;
+    const sint64 feeReserveBefore = getContractFeeReserve(QUOTTERY_CONTRACT_INDEX);
+
+    const id smallSender = id::randomValue();
+    increaseEnergy(smallSender, belowThresholdAmount);
+    ASSERT_TRUE(qtry.transferQUByStandardTransaction(smallSender, belowThresholdAmount));
+
+    EXPECT_EQ(getBalance(smallSender), 0);
+    EXPECT_EQ(getBalance(contractId), 0);
+    EXPECT_EQ(
+        getContractFeeReserve(QUOTTERY_CONTRACT_INDEX) - feeReserveBefore,
+        belowThresholdAmount);
+
+    const id thresholdSender = id::randomValue();
+    increaseEnergy(thresholdSender, thresholdAmount);
+    ASSERT_TRUE(qtry.transferQUByStandardTransaction(thresholdSender, thresholdAmount));
+
+    EXPECT_EQ(getBalance(thresholdSender), thresholdAmount - thresholdFee);
+    EXPECT_EQ(getBalance(contractId), 0);
+    EXPECT_EQ(
+        getContractFeeReserve(QUOTTERY_CONTRACT_INDEX) - feeReserveBefore,
+        belowThresholdAmount + thresholdFee);
 }
 
 TEST(QTRYTest, Grand_Final_Complex_Lifecycle)
