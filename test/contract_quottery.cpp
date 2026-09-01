@@ -2394,7 +2394,7 @@ TEST(QTRYTest, Automatic_Cleanup_Lifecycle)
     EXPECT_FALSE(state->mDisputeInfo.get(eventId, di));
 }
 
-TEST(QTRYTest, CleanMemoryFinalizesEmptyEventAndReturnsGODeposit)
+TEST(QTRYTest, CleanMemoryIgnoresUnfinalizedEvent)
 {
     ContractTestingQtry qtry;
     auto state = qtry.getState();
@@ -2420,14 +2420,25 @@ TEST(QTRYTest, CleanMemoryFinalizesEmptyEventAndReturnsGODeposit)
     updateEtalonTime(100000);
     qtry.endEpoch();
 
-    EXPECT_GE(getBalance(operationId) - operationBalanceBeforeCleanup, deposit);
+    EXPECT_EQ(getBalance(operationId), operationBalanceBeforeCleanup);
+    EXPECT_TRUE(state->mGODepositInfo.contains(0));
+    EXPECT_TRUE(state->mEventInfo.contains(0));
+    EXPECT_TRUE(state->mEventResult.contains(0));
+    EXPECT_FALSE(state->mEventFinalFlag.contains(0));
+
+    qtry.FinalizeEvent(0, operationId);
+
+    EXPECT_EQ(getBalance(operationId) - operationBalanceBeforeCleanup, deposit);
     EXPECT_FALSE(state->mGODepositInfo.contains(0));
+    EXPECT_TRUE(state->mEventFinalFlag.contains(0));
+
+    qtry.endEpoch();
     EXPECT_FALSE(state->mEventInfo.contains(0));
     EXPECT_FALSE(state->mEventResult.contains(0));
     EXPECT_FALSE(state->mEventFinalFlag.contains(0));
 }
 
-TEST(QTRYTest, CleanMemoryRecoversFinalizedEventWithPendingGODeposit)
+TEST(QTRYTest, CleanMemoryIgnoresFinalizedEventWithPendingGODeposit)
 {
     ContractTestingQtry qtry;
     auto state = qtry.getState();
@@ -2462,20 +2473,22 @@ TEST(QTRYTest, CleanMemoryRecoversFinalizedEventWithPendingGODeposit)
 
     qtry.endEpoch();
 
-    EXPECT_GE(getBalance(operationId) - operationBalanceBeforeCleanup, deposit);
-    EXPECT_FALSE(state->mGODepositInfo.contains(0));
+    EXPECT_EQ(getBalance(operationId), operationBalanceBeforeCleanup);
+    EXPECT_TRUE(state->mGODepositInfo.contains(0));
     EXPECT_TRUE(state->mEventInfo.contains(0));
     EXPECT_TRUE(state->mEventFinalFlag.contains(0));
-    EXPECT_EQ(state->mABOrders.headIndex(bidKey), (sint64)NULL_INDEX);
+    EXPECT_NE(state->mABOrders.headIndex(bidKey), (sint64)NULL_INDEX);
 
-    // Archive is intentionally deferred because FinalizeEvent may have restored
-    // ask positions after the payout phase had already run.
+    // A later cleanup must continue to leave this inconsistent legacy state
+    // untouched instead of finalizing or archiving it implicitly.
     qtry.endEpoch();
-    EXPECT_FALSE(state->mEventInfo.contains(0));
-    EXPECT_FALSE(state->mEventFinalFlag.contains(0));
+    EXPECT_TRUE(state->mGODepositInfo.contains(0));
+    EXPECT_TRUE(state->mEventInfo.contains(0));
+    EXPECT_TRUE(state->mEventFinalFlag.contains(0));
+    EXPECT_NE(state->mABOrders.headIndex(bidKey), (sint64)NULL_INDEX);
 }
 
-TEST(QTRYTest, CleanMemoryRetriesFailedGODepositTransfer)
+TEST(QTRYTest, TryFinalizeEventRetriesFailedGODepositTransfer)
 {
     ContractTestingQtry qtry;
     auto state = qtry.getState();
@@ -2500,7 +2513,7 @@ TEST(QTRYTest, CleanMemoryRetriesFailedGODepositTransfer)
     ASSERT_GE(contractSpectrumIndex, 0);
     ASSERT_TRUE(decreaseEnergy(contractSpectrumIndex, getBalance(contractId)));
 
-    qtry.endEpoch();
+    qtry.FinalizeEvent(0, operationId);
 
     // Failed transfer must preserve every state item needed for a retry.
     EXPECT_TRUE(state->mGODepositInfo.contains(0));
@@ -2510,96 +2523,54 @@ TEST(QTRYTest, CleanMemoryRetriesFailedGODepositTransfer)
 
     increaseEnergy(contractId, deposit);
     const sint64 operationBalanceBeforeRetry = getBalance(operationId);
-    qtry.endEpoch();
+    qtry.FinalizeEvent(0, operationId);
 
-    EXPECT_GE(getBalance(operationId) - operationBalanceBeforeRetry, deposit);
+    EXPECT_EQ(getBalance(operationId) - operationBalanceBeforeRetry, deposit);
     EXPECT_FALSE(state->mGODepositInfo.contains(0));
+    EXPECT_TRUE(state->mEventInfo.contains(0));
+    EXPECT_TRUE(state->mEventFinalFlag.contains(0));
+
+    qtry.endEpoch();
     EXPECT_FALSE(state->mEventInfo.contains(0));
     EXPECT_FALSE(state->mEventFinalFlag.contains(0));
 }
 
-TEST(QTRYTest, BeginEpochRecoversLostGODepositForEvent277ExactlyOnce)
+TEST(QTRYTest, BeginEpochRecoversLostGODepositInConfiguredEpoch)
 {
     ContractTestingQtry qtry;
     auto state = qtry.getState();
     const id receiver = lostGODepositRecoveryRecipient();
     const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
-    const sint64 deposit = QUOTTERY_LOST_GO_DEPOSIT_AMOUNT;
+    const sint64 deposit = 1000000000LL;
 
-    state->mCurrentEventID = QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID + 1;
     // Mutable governance must have no influence on this historical recovery.
     state->mQtryGov.mOperationId = id::randomValue();
-    state->mQtryGov.mDepositAmountForDispute = deposit - 1;
     increaseEnergy(receiver, 1);
     increaseEnergy(contractId, deposit);
 
     const sint64 receiverBalanceBefore = getBalance(receiver);
     const sint64 contractBalanceBefore = getBalance(contractId);
-    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH;
+    system.epoch = 0;
     qtry.beginEpoch();
 
-    EXPECT_TRUE(state->mLostGODeposit277Recovered);
     EXPECT_EQ(getBalance(receiver) - receiverBalanceBefore, deposit);
     EXPECT_EQ(contractBalanceBefore - getBalance(contractId), deposit);
-
-    // Funding the contract again proves that the state flag, rather than a low
-    // contract balance, prevents a second payout.
-    increaseEnergy(contractId, deposit);
-    const sint64 receiverBalanceBeforeSecondCall = getBalance(receiver);
-    qtry.beginEpoch();
-
-    EXPECT_EQ(getBalance(receiver), receiverBalanceBeforeSecondCall);
 }
 
-TEST(QTRYTest, BeginEpochRecoveryRejectsWrongEpochOrUnsafeState)
+TEST(QTRYTest, BeginEpochRecoveryIgnoresOtherEpochs)
 {
     ContractTestingQtry qtry;
-    auto state = qtry.getState();
     const id receiver = lostGODepositRecoveryRecipient();
     const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
-    const sint64 deposit = QUOTTERY_LOST_GO_DEPOSIT_AMOUNT;
+    const sint64 deposit = 1000000000LL;
 
-    state->mCurrentEventID = QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID + 1;
-    state->mQtryGov.mOperationId = id::randomValue();
     increaseEnergy(receiver, 1);
     increaseEnergy(contractId, deposit);
 
-    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH + 1;
-    qtry.beginEpoch();
-    EXPECT_FALSE(state->mLostGODeposit277Recovered);
-    EXPECT_EQ(getBalance(contractId), deposit);
-
-    QUOTTERY::QtryEventInfo eventInfo;
-    setMemory(eventInfo, 0);
-    eventInfo.eid = QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID;
-    state->mEventInfo.set(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID, eventInfo);
-    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH;
-    qtry.beginEpoch();
-    EXPECT_FALSE(state->mLostGODeposit277Recovered);
-    EXPECT_EQ(getBalance(contractId), deposit);
-}
-
-TEST(QTRYTest, BeginEpochRecoveryDoesNotRunAfterConfiguredEpoch)
-{
-    ContractTestingQtry qtry;
-    auto state = qtry.getState();
-    const id receiver = lostGODepositRecoveryRecipient();
-    const id contractId = id(QUOTTERY_CONTRACT_INDEX, 0, 0, 0);
-    const sint64 deposit = QUOTTERY_LOST_GO_DEPOSIT_AMOUNT;
-
-    state->mCurrentEventID = QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID + 1;
-    increaseEnergy(receiver, 1);
-    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH;
-    qtry.beginEpoch();
-
-    EXPECT_FALSE(state->mLostGODeposit277Recovered);
-
-    increaseEnergy(contractId, deposit);
     const sint64 receiverBalanceBefore = getBalance(receiver);
-    system.epoch = QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH + 1;
+    system.epoch = 1;
     qtry.beginEpoch();
 
-    EXPECT_FALSE(state->mLostGODeposit277Recovered);
     EXPECT_EQ(getBalance(receiver), receiverBalanceBefore);
     EXPECT_EQ(getBalance(contractId), deposit);
 }
@@ -2887,6 +2858,7 @@ TEST(QTRYTest, EndEpoch_Full_Lifecycle_Payouts_And_Dividends)
     updateEtalonTime(7200);
     qtry.PublishResult(eventId, 1, operation_id, state->mQtryGov.mDepositAmountForDispute);
     updateEtalonTime(100000);
+    qtry.FinalizeEvent(eventId, operation_id);
 
     sint64 winnerBalBefore = qtry.balanceUSD(winner);
     sint64 shareholderBalBefore = qtry.balanceUSD(shareholder);

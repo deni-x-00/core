@@ -30,16 +30,10 @@ constexpr uint64 QUOTTERY_MATCH_TYPE_2 = 100011; // A0,A1;
 constexpr uint64 QUOTTERY_MATCH_TYPE_3 = 100012; // B0,B1;
 constexpr uint64 QUOTTERY_ADD_BID = 100013;
 constexpr uint64 QUOTTERY_ADD_ASK = 100014;
-constexpr uint64 QUOTTERY_RECOVERED_LOST_GO_DEPOSIT = 100015;
 constexpr uint64 QUOTTERY_ASK_BIT = 0;
 constexpr uint64 QUOTTERY_BID_BIT = 1;
 constexpr uint64 QUOTTERY_EID_MASK = 0x3FFFFFFFFFFFFFFFULL; // (2^62 - 1);
 constexpr uint64 QUOTTERY_MAX_AMOUNT = 2000000000000LL; // 2 trillion;
-constexpr uint64 QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID = 277;
-constexpr sint64 QUOTTERY_LOST_GO_DEPOSIT_AMOUNT = 1000000000LL;
-// Replace 0 with the exact future deployment epoch before release. Epoch 0 is
-// historical, so this recovery remains disabled until a value is configured.
-constexpr uint16 QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH = 0;
 constexpr uint64 QUOTTERY_DIRECT_TRANSFER_REFUND_FEE_DIVISOR = 100ULL;
 constexpr sint64 QUOTTERY_MIN_DIRECT_TRANSFER_REFUND_FEE = 100000LL;
 constexpr sint8 QUOTTERY_RESULT_NOT_SET = -1;
@@ -87,15 +81,6 @@ public:
         sint8 _terminator; // Only data before "_terminator" are logged
     };
 
-    struct QuotteryGODepositRecoveryLogger
-    {
-        uint32 _contractIndex;
-        uint32 _type;
-        id receiver;
-        uint64 eventId;
-        sint64 amount;
-        sint8 _terminator;
-    };
     /**************************************/
     /********INPUT AND OUTPUT STRUCTS******/
     /**************************************/
@@ -238,7 +223,6 @@ public:
         HashMap<id, sint32, 1024> mVoteMap;
         Array<GovHolder, 1024> mGovArray;
         Array<sint64, 1024> mAccumulatedSum;
-        bit mLostGODeposit277Recovered;
     };
 
 
@@ -1680,38 +1664,6 @@ public:
     {
     };
 
-    struct ReturnGODeposit_input
-    {
-        uint64 eventId;
-    };
-    struct ReturnGODeposit_output
-    {
-        bit ok;
-        bit returned;
-    };
-    struct ReturnGODeposit_locals
-    {
-        DepositInfo deposit;
-    };
-
-    PRIVATE_PROCEDURE_WITH_LOCALS(ReturnGODeposit)
-    {
-        output.ok = 0;
-        output.returned = 0;
-        if (!state.get().mGODepositInfo.get(input.eventId, locals.deposit))
-        {
-            output.ok = 1;
-            return;
-        }
-        if (qpi.transfer(locals.deposit.pubkey, locals.deposit.amount) < 0)
-        {
-            return;
-        }
-        state.mut().mGODepositInfo.removeByKey(input.eventId);
-        output.ok = 1;
-        output.returned = 1;
-    }
-
     struct FinalizeEvent_locals
     {
         sint64 index;
@@ -1985,8 +1937,6 @@ public:
         QuotteryLogger log;
         uint32 publishResultTick;
 
-        ReturnGODeposit_input returnDepositInput;
-        ReturnGODeposit_output returnDepositOutput;
         FinalizeEvent_input fei;
         FinalizeEvent_output feo;
     };
@@ -2035,12 +1985,15 @@ public:
             locals.winOption = 1;
         }
 
-        // ALL passed, no dispute, return the deposit to GO
-        locals.returnDepositInput.eventId = input.eventId;
-        CALL(ReturnGODeposit, locals.returnDepositInput, locals.returnDepositOutput);
-        if (!locals.returnDepositOutput.ok)
+        // Remove the deposit record only after the transfer succeeds. On
+        // failure, the GO can safely retry TryFinalizeEvent later.
+        if (state.get().mGODepositInfo.get(input.eventId, locals.di))
         {
-            return;
+            if (qpi.transfer(locals.di.pubkey, locals.di.amount) < 0)
+            {
+                return;
+            }
+            state.mut().mGODepositInfo.removeByKey(input.eventId);
         }
 
         locals.fei.eventId = input.eventId;
@@ -2486,73 +2439,19 @@ public:
         id key;
         QtryOrder v;
         sint8 userOption;
-        QtryEventInfo qei;
-        id uid;
         sint8 winOption;
         RewardTransfer_input rti;
         RewardTransfer_output rto;
-        sint32 i;
-        bit flag;
         QuotteryLoggerWithData log;
-        uint32 publishResultTick;
-        DepositInfo di;
-        ReturnGODeposit_input returnDepositInput;
-        ReturnGODeposit_output returnDepositOutput;
-        FinalizeEvent_input finalizeInput;
-        FinalizeEvent_output finalizeOutput;
     };
     PUBLIC_PROCEDURE_WITH_LOCALS(CleanMemory)
     {
         // Only the system or GO can call this
         if (qpi.invocator() == NULL_ID || qpi.invocator() == state.get().mQtryGov.mOperationId)
         {
-            // Finalize eligible events once, independently from their positions.
-            // Iterating mEventResult is safe because FinalizeEvent mutates orders and
-            // positions, but does not mutate mEventResult.
-            locals.index = NULL_INDEX;
-            do {
-                locals.index = state.get().mEventResult.nextElementIndex(locals.index);
-                if (locals.index != NULL_INDEX)
-                {
-                    locals.eid = state.get().mEventResult.key(locals.index);
-                    locals.winOption = state.get().mEventResult.value(locals.index);
-                    if (locals.winOption == QUOTTERY_RESULT_NOT_SET ||
-                        state.get().mEventFinalFlag.contains(locals.eid) ||
-                        state.get().mDisputeInfo.contains(locals.eid) ||
-                        !state.get().mEventInfo.contains(locals.eid) ||
-                        !state.get().mEventResultPublishTickTime.get(locals.eid, locals.publishResultTick) ||
-                        locals.publishResultTick + QUOTTERY_DISPUTE_WINDOW > qpi.tick())
-                    {
-                        continue;
-                    }
-
-                    locals.returnDepositInput.eventId = locals.eid;
-                    CALL(ReturnGODeposit, locals.returnDepositInput, locals.returnDepositOutput);
-                    if (!locals.returnDepositOutput.ok)
-                    {
-                        continue;
-                    }
-
-                    locals.finalizeInput.eventId = locals.eid;
-                    locals.finalizeInput.winOption = (uint64)locals.winOption;
-                    CALL(FinalizeEvent, locals.finalizeInput, locals.finalizeOutput);
-                }
-            } while (locals.index != NULL_INDEX);
-
-            // Reset the per-cleanup archive readiness marker. The key presence means
-            // the event is finalized; the value is false only while payouts remain.
-            locals.index = NULL_INDEX;
-            do {
-                locals.index = state.get().mEventFinalFlag.nextElementIndex(locals.index);
-                if (locals.index != NULL_INDEX)
-                {
-                    state.mut().mEventFinalFlag.set(
-                        state.get().mEventFinalFlag.key(locals.index),
-                        true);
-                }
-            } while (locals.index != NULL_INDEX);
-
-            // Payout all positions belonging to genuinely finalized events.
+            // Only TryFinalizeEvent/ResolveDispute may finalize an event.
+            // CleanMemory ignores non-finalized events and inconsistent legacy
+            // states whose GO deposit is still pending.
             locals.index = NULL_INDEX;
             do {
                 locals.index = state.get().mPositionInfo.nextElementIndex(locals.index);
@@ -2563,6 +2462,7 @@ public:
                     locals.eid = locals.key.u64._3 & QUOTTERY_EID_MASK;
                     locals.userOption = locals.key.u64._3 >> 63;
                     if (state.get().mEventFinalFlag.contains(locals.eid) &&
+                        !state.get().mGODepositInfo.contains(locals.eid) &&
                         state.get().mEventResult.get(locals.eid, locals.winOption) &&
                         locals.winOption != QUOTTERY_RESULT_NOT_SET)
                     {
@@ -2590,31 +2490,15 @@ public:
                 if (locals.index != NULL_INDEX)
                 {
                     locals.eid = state.get().mEventFinalFlag.key(locals.index);
+                    if (state.get().mGODepositInfo.contains(locals.eid))
+                    {
+                        continue;
+                    }
                     if (!state.get().mEventFinalFlag.value(locals.index)) // flag as false
                     {
-                        continue;
-                    }
-
-                    // Backward-compatible recovery for events that were marked final
-                    // by older code while their GO deposit was still pending.
-                    locals.returnDepositInput.eventId = locals.eid;
-                    CALL(ReturnGODeposit, locals.returnDepositInput, locals.returnDepositOutput);
-                    if (!locals.returnDepositOutput.ok)
-                    {
-                        state.mut().mEventFinalFlag.set(locals.eid, false);
-                        continue;
-                    }
-                    if (locals.returnDepositOutput.returned)
-                    {
-                        // This is a legacy state produced by the old CleanMemory:
-                        // final flag was set directly, but FinalizeEvent was skipped.
-                        // Run the real finalizer now and defer payout/archive because
-                        // returning ask orders may have created positions.
-                        locals.finalizeInput.eventId = locals.eid;
-                        state.get().mEventResult.get(locals.eid, locals.winOption);
-                        locals.finalizeInput.winOption = (uint64)locals.winOption;
-                        CALL(FinalizeEvent, locals.finalizeInput, locals.finalizeOutput);
-                        state.mut().mEventFinalFlag.set(locals.eid, false);
+                        // A user payout failed during this cleanup. Reset the
+                        // retry marker but defer archival until the next pass.
+                        state.mut().mEventFinalFlag.set(locals.eid, true);
                         continue;
                     }
 
@@ -2648,13 +2532,7 @@ public:
         }
     }
 
-    struct BEGIN_EPOCH_locals
-    {
-        id recoveryReceiver;
-        QuotteryGODepositRecoveryLogger recoveryLog;
-    };
-
-    BEGIN_EPOCH_WITH_LOCALS()
+    BEGIN_EPOCH()
     {
         // TODO: reinitialize after proposal getting passed
         if (qpi.epoch() == 210)
@@ -2662,44 +2540,14 @@ public:
             CALL(Reinit, input, output);
         }
 
-        if (qpi.epoch() != QUOTTERY_LOST_GO_DEPOSIT_RECOVERY_EPOCH ||
-            state.get().mLostGODeposit277Recovered)
+        // One-time recovery of the archived event 277 GO deposit. Replace epoch
+        // 0 with the exact future deployment epoch before release.
+        if (qpi.epoch() == 0)
         {
-            return;
+            qpi.transfer(
+                ID(_P, _R, _E, _D, _P, _W, _E, _P, _W, _I, _J, _U, _X, _B, _L, _W, _N, _C, _G, _Q, _S, _H, _L, _R, _U, _G, _V, _C, _D, _A, _N, _P, _O, _H, _C, _Y, _H, _K, _Z, _Y, _A, _E, _V, _I, _B, _E, _A, _O, _R, _R, _A, _O, _W, _F, _A, _H),
+                1000000000LL);
         }
-
-        // Event 277 must be fully archived so no normal lifecycle path can
-        // still own or return this historical deposit.
-        if (state.get().mCurrentEventID <= QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID ||
-            state.get().mEventInfo.contains(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID) ||
-            state.get().mEventResult.contains(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID) ||
-            state.get().mEventResultPublishTickTime.contains(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID) ||
-            state.get().mEventFinalFlag.contains(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID) ||
-            state.get().mDisputeInfo.contains(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID) ||
-            state.get().mDisputeResolver.contains(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID) ||
-            state.get().mGODepositInfo.contains(QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID))
-        {
-            return;
-        }
-
-        // The receiver and amount are immutable historical facts. In
-        // particular, a future governance-appointed GO cannot redirect them.
-        locals.recoveryReceiver = ID(_P, _R, _E, _D, _P, _W, _E, _P, _W, _I, _J, _U, _X, _B, _L, _W, _N, _C, _G, _Q, _S, _H, _L, _R, _U, _G, _V, _C, _D, _A, _N, _P, _O, _H, _C, _Y, _H, _K, _Z, _Y, _A, _E, _V, _I, _B, _E, _A, _O, _R, _R, _A, _O, _W, _F, _A, _H);
-        if (qpi.transfer(locals.recoveryReceiver, QUOTTERY_LOST_GO_DEPOSIT_AMOUNT) < 0)
-        {
-            return;
-        }
-
-        state.mut().mLostGODeposit277Recovered = 1;
-        locals.recoveryLog = QuotteryGODepositRecoveryLogger{
-            0,
-            QUOTTERY_RECOVERED_LOST_GO_DEPOSIT,
-            locals.recoveryReceiver,
-            QUOTTERY_LOST_GO_DEPOSIT_EVENT_ID,
-            QUOTTERY_LOST_GO_DEPOSIT_AMOUNT,
-            0
-        };
-        LOG_INFO(locals.recoveryLog);
     }
 
     struct END_EPOCH_locals
